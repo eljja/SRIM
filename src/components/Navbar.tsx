@@ -10,6 +10,8 @@ import {
   Share2,
 } from 'lucide-react';
 import { DEMO_PRESETS, type DemoPreset } from '../data';
+import { SEMICONDUCTOR_PRESETS } from '../data/semiconductorPresets';
+import type { TrimSetupConfig } from '../physics/types';
 
 export type ActiveModule =
   | 'setup'
@@ -22,6 +24,7 @@ interface NavbarProps {
   activeModule: ActiveModule;
   onSelectModule: (mod: ActiveModule) => void;
   onLoadDemo: (demo: DemoPreset) => void;
+  onLoadPreset?: (config: TrimSetupConfig) => void;
   onOpenPTableModal: () => void;
   onShareSession?: () => void;
   currentTitle: string;
@@ -31,6 +34,7 @@ export const Navbar: React.FC<NavbarProps> = ({
   activeModule,
   onSelectModule,
   onLoadDemo,
+  onLoadPreset,
   onOpenPTableModal,
   onShareSession,
   currentTitle,
@@ -133,24 +137,45 @@ export const Navbar: React.FC<NavbarProps> = ({
           <div className="relative flex items-center">
             <Sparkles className="w-3.5 h-3.5 text-amber-400 absolute left-2.5 pointer-events-none" />
             <select
-              aria-label="Load Official SRIM Demo Preset"
-              className="bg-slate-900 border border-slate-700 hover:border-amber-500/50 text-xs text-slate-200 rounded-lg pl-8 pr-3 py-1.5 focus:outline-none focus:border-cyan-500"
-              defaultValue=""
+              aria-label="Load Semiconductor or SRIM Demo Preset"
+              className="bg-slate-900 border border-slate-700 hover:border-amber-500/50 text-xs text-slate-200 rounded-lg pl-8 pr-3 py-1.5 max-w-[260px] focus:outline-none focus:border-cyan-500"
+              value=""
               onChange={(e) => {
-                const found = DEMO_PRESETS.find((d) => d.id === e.target.value);
+                const val = e.target.value;
+                const semi = SEMICONDUCTOR_PRESETS.find((p) => p.id === val);
+                if (semi && onLoadPreset) {
+                  onLoadPreset({
+                    ...semi.config,
+                    layers: semi.config.layers.map((l) => ({
+                      ...l,
+                      elements: l.elements.map((el) => ({ ...el })),
+                    })),
+                  });
+                  return;
+                }
+                const found = DEMO_PRESETS.find((d) => d.id === val);
                 if (found) {
                   onLoadDemo(found);
                 }
               }}
             >
               <option value="" disabled>
-                Load Official Demo (Trim.d00–d11)...
+                Load Implant Preset ({SEMICONDUCTOR_PRESETS.length + DEMO_PRESETS.length})...
               </option>
-              {DEMO_PRESETS.map((d) => (
-                <option key={d.id} value={d.id}>
-                  [{d.id}] {d.title} ({d.energyKeV} keV)
-                </option>
-              ))}
+              <optgroup label="Semiconductor Process Presets (Si CMOS / SiC / GaN / III-V)">
+                {SEMICONDUCTOR_PRESETS.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    [{p.processTag}] {p.title}
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="Official SRIM-2003 Demos (Trim.d00–d11)">
+                {DEMO_PRESETS.map((d) => (
+                  <option key={d.id} value={d.id}>
+                    [{d.id}] {d.title} ({d.energyKeV} keV)
+                  </option>
+                ))}
+              </optgroup>
             </select>
           </div>
 

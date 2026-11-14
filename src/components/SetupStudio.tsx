@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import {
   Atom,
   Layers,
@@ -12,6 +12,9 @@ import {
   Table2,
   Sparkles,
   Check,
+  Cpu,
+  FlaskConical,
+  Scale,
 } from 'lucide-react';
 import {
   SCOEF03,
@@ -22,6 +25,20 @@ import {
   type CompoundEntry,
   type DemoPreset,
 } from '../data';
+import {
+  SEMICONDUCTOR_MATERIALS,
+  type SemiconductorMaterial,
+  type SemiMaterialCategory,
+} from '../data/semiconductorMaterials';
+import {
+  SEMICONDUCTOR_PRESETS,
+  type PresetCategory,
+} from '../data/semiconductorPresets';
+import {
+  parseChemicalFormula,
+  formatFormulaString,
+  computeLayerAtomicDensity,
+} from '../physics/formulaParser';
 import { BOND_DEFINITIONS, calcCoreAndBond } from '../physics/stopping';
 import {
   generateTrimIn,
@@ -53,6 +70,13 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
   const [activeLayerIdx, setActiveLayerIdx] = useState<number>(0);
   const [compoundSearch, setCompoundSearch] = useState<string>('');
   const [compoundCategory, setCompoundCategory] = useState<string>('ALL');
+  const [presetTab, setPresetTab] = useState<'semi' | 'srim'>('semi');
+  const [presetCategory, setPresetCategory] = useState<'ALL' | PresetCategory>('ALL');
+  const [materialTab, setMaterialTab] = useState<'semi' | 'legacy'>('semi');
+  const [semiMatCategory, setSemiMatCategory] = useState<'ALL' | SemiMaterialCategory>('ALL');
+  const [semiMatSearch, setSemiMatSearch] = useState<string>('');
+  const [formulaInput, setFormulaInput] = useState<string>('');
+  const [formulaError, setFormulaError] = useState<string | null>(null);
   const [showCabModal, setShowCabModal] = useState<boolean>(false);
   const [cabBonds, setCabBonds] = useState<number[]>(new Array(18).fill(0));
   const [cabCompoundName, setCabCompoundName] = useState<string>('');
@@ -89,8 +113,50 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
     }).slice(0, 120);
   }, [compoundSearch, compoundCategory]);
 
+  const filteredSemiMaterials = useMemo(() => {
+    const q = semiMatSearch.trim().toLowerCase();
+    return SEMICONDUCTOR_MATERIALS.filter((m) => {
+      if (semiMatCategory !== 'ALL' && m.category !== semiMatCategory) {
+        return false;
+      }
+      if (!q) return true;
+      return (
+        m.name.toLowerCase().includes(q) ||
+        m.formula.toLowerCase().includes(q) ||
+        m.processNote.toLowerCase().includes(q)
+      );
+    });
+  }, [semiMatCategory, semiMatSearch]);
+
+  const filteredSemiPresets = useMemo(() => {
+    return SEMICONDUCTOR_PRESETS.filter((p) => {
+      if (presetCategory !== 'ALL' && p.category !== presetCategory) {
+        return false;
+      }
+      return true;
+    });
+  }, [presetCategory]);
+
   const currentLayer: TrimLayerConfig =
     config.layers[activeLayerIdx] || config.layers[0];
+
+  const currentFormula = useMemo(
+    () => (currentLayer ? formatFormulaString(currentLayer.elements) : ''),
+    [currentLayer]
+  );
+
+  const currentAtomicDensity = useMemo(
+    () =>
+      currentLayer
+        ? computeLayerAtomicDensity(currentLayer.densityGPerCm3, currentLayer.elements)
+        : 0,
+    [currentLayer]
+  );
+
+  useEffect(() => {
+    setFormulaInput(currentFormula);
+    setFormulaError(null);
+  }, [activeLayerIdx, currentFormula]);
 
   const cabPreview = useMemo(() => {
     if (!currentLayer) return null;
@@ -236,6 +302,55 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
       compoundCorr: Number(cab.recommendedCorr.toFixed(4)),
       elements,
     });
+  };
+
+  const applySemiMaterialToLayer = (mat: SemiconductorMaterial) => {
+    setCabCompoundName(mat.name);
+    updateLayer(activeLayerIdx, {
+      name: mat.name.split(' (')[0],
+      densityGPerCm3: mat.densityGPerCm3,
+      phase: mat.phase,
+      compoundCorr: mat.compoundCorr,
+      elements: mat.elements.map((e) => ({ ...e })),
+    });
+    setFormulaError(null);
+  };
+
+  const handleApplyFormula = () => {
+    const parsed = parseChemicalFormula(formulaInput);
+    if (!parsed) {
+      setFormulaError('Invalid formula (e.g. SiO2, Si0.7Ge0.3, Si1.2N1.0, Hf0.5Zr0.5O2)');
+      return;
+    }
+    const existingByZ = new Map(currentLayer.elements.map((el) => [el.z, el]));
+    const nextElems: TrimElementConfig[] = parsed.map((p) => {
+      const prev = existingByZ.get(p.z);
+      const sc = getElementByZ(p.z);
+      const pt = getPTableElement(p.z);
+      return {
+        z: p.z,
+        symbol: sc.symbol,
+        name: sc.name,
+        stoich: p.stoich,
+        massAmu: prev?.massAmu ?? sc.naturalWeight,
+        displacementEv: prev?.displacementEv ?? pt?.defaultEd ?? 20.0,
+        latticeBindingEv: prev?.latticeBindingEv ?? pt?.defaultEb ?? 2.5,
+        surfaceBindingEv: prev?.surfaceBindingEv ?? pt?.defaultEs ?? sc.heatSubl ?? 2.5,
+      };
+    });
+    updateLayer(activeLayerIdx, { elements: nextElems });
+    setFormulaError(null);
+  };
+
+  const handleNormalizeStoich = () => {
+    if (!currentLayer || currentLayer.elements.length === 0) return;
+    const sum = currentLayer.elements.reduce((acc, el) => acc + Math.max(0, el.stoich), 0);
+    if (sum <= 0) return;
+    const nextElems = currentLayer.elements.map((el) => ({
+      ...el,
+      stoich: Number((el.stoich / sum).toFixed(4)),
+    }));
+    updateLayer(activeLayerIdx, { elements: nextElems });
   };
 
   const downloadFile = (filename: string, content: string) => {
@@ -589,39 +704,134 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
             </div>
           </div>
 
-          {/* Official SRIM 2003 Demo Presets Grid */}
+          {/* Semiconductor Process & Official SRIM Demo Presets */}
           <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-5 space-y-3">
-            <div className="flex items-center gap-2 border-b border-slate-800 pb-2.5">
-              <Sparkles className="w-4 h-4 text-amber-400" />
-              <h2 className="text-sm font-bold text-white">
-                Official SRIM-2003 Demo Library (Trim.d00–d11)
-              </h2>
-            </div>
-            <div className="grid grid-cols-1 gap-1.5 max-h-[250px] overflow-y-auto pr-1">
-              {DEMO_PRESETS.map((demo: DemoPreset) => (
+            <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Cpu className="w-4 h-4 text-cyan-400" />
+                <h2 className="text-sm font-bold text-white">
+                  Implantation Preset Library
+                </h2>
+              </div>
+              <div className="flex items-center gap-1 bg-slate-950 p-0.5 rounded-lg border border-slate-800 text-[11px]">
                 <button
-                  key={demo.id}
-                  onClick={() => onChangeConfig(parseTrimIn(demo.rawTrimIn))}
-                  className="text-left p-2 rounded-lg bg-slate-950/70 hover:bg-slate-800 border border-slate-800/80 transition-colors flex items-center justify-between gap-2"
+                  onClick={() => setPresetTab('semi')}
+                  className={`px-2 py-1 rounded-md font-semibold transition-colors ${
+                    presetTab === 'semi'
+                      ? 'bg-cyan-600 text-white'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
                 >
-                  <div>
-                    <div className="text-xs font-semibold text-slate-200">
-                      <span className="text-amber-400 font-mono mr-1.5">
-                        [{demo.id}]
-                      </span>
-                      {demo.title}
-                    </div>
-                    <div className="text-[10px] text-slate-400">
-                      Ion Z={demo.ionZ} ({demo.energyKeV} keV, {demo.angleDeg}°) ·{' '}
-                      {demo.layers.length} Layer(s) · Mode {demo.calcMode}
-                    </div>
-                  </div>
-                  <span className="text-[10px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300">
-                    Load
-                  </span>
+                  Semiconductor ({SEMICONDUCTOR_PRESETS.length})
                 </button>
-              ))}
+                <button
+                  onClick={() => setPresetTab('srim')}
+                  className={`px-2 py-1 rounded-md font-semibold transition-colors ${
+                    presetTab === 'srim'
+                      ? 'bg-amber-600 text-white'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  SRIM Demos ({DEMO_PRESETS.length})
+                </button>
+              </div>
             </div>
+
+            {presetTab === 'semi' ? (
+              <>
+                <div className="flex flex-wrap gap-1">
+                  {(
+                    [
+                      'ALL',
+                      'Si CMOS FEOL',
+                      'Power (SiC / GaN)',
+                      'III-V / Photonics',
+                      'Display / Mask / FIB',
+                    ] as const
+                  ).map((cat) => (
+                    <button
+                      key={cat}
+                      onClick={() => setPresetCategory(cat)}
+                      className={`px-2 py-0.5 rounded text-[10px] font-semibold border transition-colors ${
+                        presetCategory === cat
+                          ? 'bg-cyan-500/20 text-cyan-200 border-cyan-500/50'
+                          : 'bg-slate-950 text-slate-400 border-slate-800 hover:text-slate-200'
+                      }`}
+                    >
+                      {cat}
+                    </button>
+                  ))}
+                </div>
+
+                <div className="grid grid-cols-1 gap-1.5 max-h-[300px] overflow-y-auto pr-1">
+                  {filteredSemiPresets.map((preset) => (
+                    <button
+                      key={preset.id}
+                      onClick={() => {
+                        onChangeConfig({
+                          ...preset.config,
+                          layers: preset.config.layers.map((l) => ({
+                            ...l,
+                            elements: l.elements.map((e) => ({ ...e })),
+                          })),
+                        });
+                        setActiveLayerIdx(0);
+                      }}
+                      className="text-left p-2.5 rounded-lg bg-slate-950/75 hover:bg-slate-800 border border-slate-800/90 hover:border-cyan-500/40 transition-colors flex items-start justify-between gap-2"
+                    >
+                      <div className="min-w-0">
+                        <div className="text-xs font-semibold text-slate-100 leading-snug">
+                          <span className="text-cyan-400 font-mono mr-1.5">
+                            [{preset.processTag}]
+                          </span>
+                          {preset.title}
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-0.5 line-clamp-2">
+                          {preset.summary}
+                        </div>
+                        <div className="text-[10px] text-slate-500 font-mono mt-0.5">
+                          {preset.config.ion.symbol} ({preset.config.ion.energyKeV} keV,{' '}
+                          {preset.config.ion.angleDeg}°) · {preset.config.layers.length}{' '}
+                          Layer(s) · Mode {preset.config.calculationMode}
+                        </div>
+                      </div>
+                      <span className="shrink-0 text-[10px] px-2 py-0.5 rounded bg-cyan-500/15 text-cyan-300 font-semibold mt-0.5">
+                        Load
+                      </span>
+                    </button>
+                  ))}
+                </div>
+              </>
+            ) : (
+              <div className="grid grid-cols-1 gap-1.5 max-h-[300px] overflow-y-auto pr-1">
+                {DEMO_PRESETS.map((demo: DemoPreset) => (
+                  <button
+                    key={demo.id}
+                    onClick={() => {
+                      onChangeConfig(parseTrimIn(demo.rawTrimIn));
+                      setActiveLayerIdx(0);
+                    }}
+                    className="text-left p-2 rounded-lg bg-slate-950/70 hover:bg-slate-800 border border-slate-800/80 transition-colors flex items-center justify-between gap-2"
+                  >
+                    <div>
+                      <div className="text-xs font-semibold text-slate-200">
+                        <span className="text-amber-400 font-mono mr-1.5">
+                          [{demo.id}]
+                        </span>
+                        {demo.title}
+                      </div>
+                      <div className="text-[10px] text-slate-400">
+                        Ion Z={demo.ionZ} ({demo.energyKeV} keV, {demo.angleDeg}°) ·{' '}
+                        {demo.layers.length} Layer(s) · Mode {demo.calcMode}
+                      </div>
+                    </div>
+                    <span className="text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 font-semibold">
+                      Load
+                    </span>
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
         </div>
 
@@ -728,12 +938,44 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
                     />
                   </div>
                   <div>
-                    <label className="block text-[11px] text-slate-400 mb-1">
-                      Density (g/cm³)
-                    </label>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="text-[11px] text-slate-400">
+                        Density (g/cm³)
+                      </label>
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateLayer(activeLayerIdx, {
+                              densityGPerCm3: Number(
+                                Math.max(0.001, currentLayer.densityGPerCm3 * 0.95).toFixed(4)
+                              ),
+                            })
+                          }
+                          title="Reduce density by 5% (e.g. porous / PECVD film)"
+                          className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-mono text-slate-300"
+                        >
+                          -5%
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            updateLayer(activeLayerIdx, {
+                              densityGPerCm3: Number(
+                                (currentLayer.densityGPerCm3 * 1.05).toFixed(4)
+                              ),
+                            })
+                          }
+                          title="Increase density by 5% (e.g. annealed / dense film)"
+                          className="px-1 py-0.2 rounded bg-slate-800 hover:bg-slate-700 text-[10px] font-mono text-slate-300"
+                        >
+                          +5%
+                        </button>
+                      </div>
+                    </div>
                     <input
                       type="number"
-                      step="0.001"
+                      step="0.01"
                       value={currentLayer.densityGPerCm3}
                       onChange={(e) =>
                         updateLayer(activeLayerIdx, {
@@ -790,35 +1032,94 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
                   </div>
                 </div>
 
+                {/* Formula Quick Editor & Live Atomic Density Bar */}
+                <div className="p-2.5 rounded-lg bg-slate-900/75 border border-slate-800 flex flex-wrap items-center justify-between gap-3">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="flex items-center gap-1.5 text-xs text-cyan-300 font-semibold">
+                      <FlaskConical className="w-3.5 h-3.5" />
+                      <span>Formula:</span>
+                    </div>
+                    <input
+                      type="text"
+                      value={formulaInput}
+                      onChange={(e) => {
+                        setFormulaInput(e.target.value);
+                        setFormulaError(null);
+                      }}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') handleApplyFormula();
+                      }}
+                      placeholder="e.g. SiO2, Si0.7Ge0.3, Si1.2N1.0"
+                      className="bg-slate-950 border border-slate-700 focus:border-cyan-500 rounded-md px-2.5 py-1 text-xs font-mono text-white w-48"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleApplyFormula}
+                      className="px-2.5 py-1 rounded-md bg-cyan-600/80 hover:bg-cyan-500 text-white text-[11px] font-semibold transition-colors"
+                    >
+                      Apply Formula
+                    </button>
+                    {formulaError && (
+                      <span className="text-[11px] text-rose-400">
+                        {formulaError}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-4 text-[11px] font-mono">
+                    <div>
+                      <span className="text-slate-400">Empirical: </span>
+                      <span className="text-cyan-300 font-bold">{currentFormula}</span>
+                    </div>
+                    <div>
+                      <span className="text-slate-400">Atomic Density: </span>
+                      <span className="text-emerald-300 font-bold">
+                        {currentAtomicDensity.toExponential(3)} atoms/cm³
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
                 {/* Elements Table in Active Layer */}
                 <div className="space-y-2">
-                  <div className="flex items-center justify-between">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
                     <span className="text-xs font-semibold text-slate-300">
                       Atomic Stoichiometry & Damage Thresholds (E<sub>d</sub>, E<sub>b</sub>, E<sub>s</sub>)
                     </span>
-                    <button
-                      onClick={() => {
-                        const oEl = getElementByZ(8);
-                        const nextElems: TrimElementConfig[] = [
-                          ...currentLayer.elements,
-                          {
-                            z: 8,
-                            symbol: 'O',
-                            name: 'Oxygen',
-                            stoich: 1.0,
-                            massAmu: oEl.naturalWeight,
-                            displacementEv: 28.0,
-                            latticeBindingEv: 3.0,
-                            surfaceBindingEv: 2.0,
-                          },
-                        ];
-                        updateLayer(activeLayerIdx, { elements: nextElems });
-                      }}
-                      className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                      <span>Add Element to Layer</span>
-                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={handleNormalizeStoich}
+                        title="Normalize atomic stoichiometries so their sum equals 1.0"
+                        className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs"
+                      >
+                        <Scale className="w-3.5 h-3.5" />
+                        <span>Normalize (Sum=1)</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          const oEl = getElementByZ(8);
+                          const nextElems: TrimElementConfig[] = [
+                            ...currentLayer.elements,
+                            {
+                              z: 8,
+                              symbol: 'O',
+                              name: 'Oxygen',
+                              stoich: 1.0,
+                              massAmu: oEl.naturalWeight,
+                              displacementEv: 28.0,
+                              latticeBindingEv: 3.0,
+                              surfaceBindingEv: 2.0,
+                            },
+                          ];
+                          updateLayer(activeLayerIdx, { elements: nextElems });
+                        }}
+                        className="flex items-center gap-1 px-2.5 py-1 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 text-xs"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Add Element to Layer</span>
+                      </button>
+                    </div>
                   </div>
 
                   <div className="overflow-x-auto">
@@ -898,7 +1199,8 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
                             <td className="py-1.5 px-2">
                               <input
                                 type="number"
-                                step="0.1"
+                                step="0.05"
+                                min="0.0001"
                                 value={el.stoich}
                                 onChange={(ev) => {
                                   const next = currentLayer.elements.map(
@@ -1140,86 +1442,180 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
             )}
           </div>
 
-          {/* 386-Entry Compound Dictionary Browser (Compound.dat + SrimIn.mdb) */}
+          {/* Semiconductor Thin-Film Library & 386-Entry Compound Dictionary */}
           <div className="bg-slate-900/75 border border-slate-800 rounded-2xl p-5 space-y-4">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 pb-3">
               <div className="flex items-center gap-2">
                 <BookMarked className="w-4 h-4 text-emerald-400" />
                 <div>
                   <h2 className="text-sm font-bold text-white">
-                    3. Compound Dictionary ({COMPOUNDS.length} Materials from
-                    Compound.dat & SrimIn.mdb)
+                    3. Semiconductor Thin-Film & Compound Library
                   </h2>
                   <p className="text-xs text-slate-400">
-                    Click any compound to populate Layer {activeLayerIdx + 1}{' '}
-                    with its stoichiometry, density, phase, and CAB chemical bond
-                    correction
+                    Click any film to apply its default formula & density to Layer{' '}
+                    {activeLayerIdx + 1} — then freely fine-tune stoichiometry or
+                    process density above
                   </p>
                 </div>
               </div>
 
-              <div className="flex items-center gap-2">
-                <select
-                  value={compoundCategory}
-                  onChange={(e) => setCompoundCategory(e.target.value)}
-                  className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+              <div className="flex items-center gap-1 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
+                <button
+                  onClick={() => setMaterialTab('semi')}
+                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
+                    materialTab === 'semi'
+                      ? 'bg-emerald-600 text-white'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
                 >
-                  {categories.map((cat) => (
-                    <option key={cat} value={cat}>
-                      {cat}
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="text"
-                  placeholder="Search SiO2, GaN, Kapton, Water, PMMA, Resist..."
-                  value={compoundSearch}
-                  onChange={(e) => setCompoundSearch(e.target.value)}
-                  className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white w-64"
-                />
+                  Semiconductor Films ({SEMICONDUCTOR_MATERIALS.length})
+                </button>
+                <button
+                  onClick={() => setMaterialTab('legacy')}
+                  className={`px-3 py-1.5 rounded-lg font-semibold transition-colors ${
+                    materialTab === 'legacy'
+                      ? 'bg-cyan-600 text-white'
+                      : 'text-slate-400 hover:text-white'
+                  }`}
+                >
+                  Compound.dat + SRIMKorea ({COMPOUNDS.length})
+                </button>
               </div>
             </div>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 max-h-[290px] overflow-y-auto pr-1">
-              {filteredCompounds.map((comp, idx) => {
-                const hasBonds =
-                  comp.bonds && comp.bonds.some((b) => b > 0);
-                return (
-                  <button
-                    key={`${comp.name}-${idx}`}
-                    onClick={() => applyCompoundToLayer(comp)}
-                    className="text-left p-2.5 rounded-xl bg-slate-950/75 hover:bg-slate-800/90 border border-slate-800/90 hover:border-emerald-500/40 transition-all flex flex-col justify-between"
+            {materialTab === 'semi' ? (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <select
+                    value={semiMatCategory}
+                    onChange={(e) =>
+                      setSemiMatCategory(e.target.value as 'ALL' | SemiMaterialCategory)
+                    }
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
                   >
-                    <div>
-                      <div className="text-xs font-bold text-white truncate">
-                        {comp.name}
+                    <option value="ALL">All Semiconductor Categories</option>
+                    <option value="Substrates & Group IV">Substrates & Group IV</option>
+                    <option value="Dielectrics (Oxide / Nitride / High-k / Low-k)">
+                      Dielectrics (Oxide / Nitride / High-k / Low-k)
+                    </option>
+                    <option value="Metals / Barriers / Silicides">
+                      Metals / Barriers / Silicides
+                    </option>
+                    <option value="III-V / Wide-Bandgap / Display / Memory">
+                      III-V / Wide-Bandgap / Display / Memory
+                    </option>
+                    <option value="Photoresists & Hardmasks">
+                      Photoresists & Hardmasks
+                    </option>
+                  </select>
+
+                  <input
+                    type="text"
+                    placeholder="Search SiO2, HfO2, SiGe, TiN, SiCOH, IGZO, SiC, GaN..."
+                    value={semiMatSearch}
+                    onChange={(e) => setSemiMatSearch(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white w-72"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2.5 max-h-[340px] overflow-y-auto pr-1">
+                  {filteredSemiMaterials.map((mat) => (
+                    <button
+                      key={mat.id}
+                      onClick={() => applySemiMaterialToLayer(mat)}
+                      className="text-left p-3 rounded-xl bg-slate-950/80 hover:bg-slate-800/90 border border-slate-800/90 hover:border-emerald-500/50 transition-all flex flex-col justify-between gap-2"
+                    >
+                      <div>
+                        <div className="flex items-start justify-between gap-2">
+                          <span className="text-xs font-bold text-white leading-snug">
+                            {mat.name}
+                          </span>
+                          <span className="shrink-0 px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono text-[10px] font-bold">
+                            {mat.formula}
+                          </span>
+                        </div>
+                        <div className="text-[11px] font-mono text-emerald-300 mt-1">
+                          ρ = {mat.densityGPerCm3.toFixed(3)} g/cm³{' '}
+                          <span className="text-[10px] text-slate-400 font-sans">
+                            ({mat.densityRange})
+                          </span>
+                        </div>
+                        <div className="text-[10px] text-slate-400 mt-1 line-clamp-2">
+                          {mat.processNote}
+                        </div>
                       </div>
-                      <div className="text-[10px] text-slate-400 mt-0.5">
-                        {comp.category} · ρ={comp.density} g/cm³ ·{' '}
-                        {comp.state === 1 ? 'Gas' : 'Solid'}
+                      <div className="text-[10px] text-slate-500 font-mono truncate">
+                        {mat.category}
                       </div>
-                    </div>
-                    <div className="mt-2 flex items-center justify-between text-[10px]">
-                      <span className="font-mono text-cyan-300">
-                        {comp.elements
-                          .map(
-                            (e) =>
-                              `${getElementByZ(e.z).symbol}${
-                                e.stoich !== 1 ? e.stoich : ''
-                              }`
-                          )
-                          .join(' ')}
-                      </span>
-                      {hasBonds && (
-                        <span className="px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                          CAB Bonds
-                        </span>
-                      )}
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <div className="flex flex-wrap items-center justify-end gap-2">
+                  <select
+                    value={compoundCategory}
+                    onChange={(e) => setCompoundCategory(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200"
+                  >
+                    {categories.map((cat) => (
+                      <option key={cat} value={cat}>
+                        {cat}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    type="text"
+                    placeholder="Search SiO2, GaN, Kapton, Water, PMMA, Resist..."
+                    value={compoundSearch}
+                    onChange={(e) => setCompoundSearch(e.target.value)}
+                    className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white w-64"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 max-h-[300px] overflow-y-auto pr-1">
+                  {filteredCompounds.map((comp, idx) => {
+                    const hasBonds =
+                      comp.bonds && comp.bonds.some((b) => b > 0);
+                    return (
+                      <button
+                        key={`${comp.name}-${idx}`}
+                        onClick={() => applyCompoundToLayer(comp)}
+                        className="text-left p-2.5 rounded-xl bg-slate-950/75 hover:bg-slate-800/90 border border-slate-800/90 hover:border-emerald-500/40 transition-all flex flex-col justify-between"
+                      >
+                        <div>
+                          <div className="text-xs font-bold text-white truncate">
+                            {comp.name}
+                          </div>
+                          <div className="text-[10px] text-slate-400 mt-0.5">
+                            {comp.category} · ρ={comp.density} g/cm³ ·{' '}
+                            {comp.state === 1 ? 'Gas' : 'Solid'}
+                          </div>
+                        </div>
+                        <div className="mt-2 flex items-center justify-between text-[10px]">
+                          <span className="font-mono text-cyan-300">
+                            {comp.elements
+                              .map(
+                                (e) =>
+                                  `${getElementByZ(e.z).symbol}${
+                                    e.stoich !== 1 ? e.stoich : ''
+                                  }`
+                              )
+                              .join(' ')}
+                          </span>
+                          {hasBonds && (
+                            <span className="px-1.5 py-0.2 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
+                              CAB Bonds
+                            </span>
+                          )}
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
           </div>
         </div>
       </div>

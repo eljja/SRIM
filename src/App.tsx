@@ -94,6 +94,11 @@ export function App() {
     setActiveModule('cockpit');
   };
 
+  const handleLoadPreset = (presetConfig: TrimSetupConfig) => {
+    setTrimConfig(presetConfig);
+    setActiveModule('cockpit');
+  };
+
   return (
     <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col relative">
       {/* Toast Notification Banner */}
@@ -108,6 +113,7 @@ export function App() {
         activeModule={activeModule}
         onSelectModule={setActiveModule}
         onLoadDemo={handleLoadDemo}
+        onLoadPreset={handleLoadPreset}
         onOpenPTableModal={() => setShowQuickPTable(true)}
         onShareSession={handleShareSession}
         currentTitle={trimConfig.title}
