@@ -8,6 +8,7 @@ import {
   BookOpen,
   Sparkles,
   Share2,
+  GitCompare,
 } from 'lucide-react';
 import { DEMO_PRESETS, type DemoPreset } from '../data';
 import { SEMICONDUCTOR_PRESETS } from '../data/semiconductorPresets';
@@ -17,6 +18,7 @@ export type ActiveModule =
   | 'setup'
   | 'cockpit'
   | 'sr'
+  | 'tcad'
   | 'ptable'
   | 'physics';
 
@@ -62,6 +64,12 @@ export const Navbar: React.FC<NavbarProps> = ({
       label: 'SR Stopping & Range',
       sub: 'SRModule.exe + PRAL92',
       icon: <Activity className="w-4 h-4" />,
+    },
+    {
+      id: 'tcad',
+      label: 'TCAD & Junction',
+      sub: 'Compact vs SRIM · xj & Rs',
+      icon: <GitCompare className="w-4 h-4" />,
     },
     {
       id: 'ptable',

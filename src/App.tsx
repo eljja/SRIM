@@ -3,6 +3,7 @@ import { Navbar, type ActiveModule } from './components/Navbar';
 import { SetupStudio } from './components/SetupStudio';
 import { TrimCockpit } from './components/TrimCockpit';
 import { SrCalculator } from './components/SrCalculator';
+import { ImplantAnalytics } from './components/ImplantAnalytics';
 import { PTableModal } from './components/PTableModal';
 import { PhysicsReference } from './components/PhysicsReference';
 import { parseTrimIn } from './physics/formats';
@@ -131,6 +132,8 @@ export function App() {
         {activeModule === 'cockpit' && <TrimCockpit config={trimConfig} />}
 
         {activeModule === 'sr' && <SrCalculator trimConfig={trimConfig} />}
+
+        {activeModule === 'tcad' && <ImplantAnalytics trimConfig={trimConfig} />}
 
         {activeModule === 'ptable' && (
           <PTableModal initialZ={trimConfig.ion.z1} />
