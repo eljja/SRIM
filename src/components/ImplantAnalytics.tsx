@@ -70,7 +70,7 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
   const [targetMatId, setTargetMatId] = useState<string>('mat-c-si');
   const [doseCm2, setDoseCm2] = useState<number>(1e15);
   const [useLogScaleY, setUseLogScaleY] = useState<boolean>(true);
-  const [mcIonCount, setMcIonCount] = useState<number>(1000);
+  const [mcIonCount, setMcIonCount] = useState<number>(10000);
   const [mcSnapshot, setMcSnapshot] = useState<TrimSnapshot | null>(null);
   const [mcRunKey, setMcRunKey] = useState<string>('');
   const [mcRunning, setMcRunning] = useState<boolean>(false);
@@ -346,6 +346,78 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
   const currentRunMatches =
     mcSnapshot !== null &&
     mcRunKey === `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}`;
+
+  /** Shared MC ion-count selector (up to 1,000,000) & Run/Stop control used across Tab 2 & Tab 3 */
+  const mcRunnerControls = (
+    <div className="flex flex-wrap items-center gap-2">
+      <div className="flex items-center gap-1.5 text-xs bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+        <span className="text-slate-400 font-semibold">MC Ions:</span>
+        <input
+          type="number"
+          min={100}
+          max={MAX_SIMULATION_IONS}
+          step={500}
+          value={mcIonCount}
+          onChange={(e) =>
+            setMcIonCount(
+              Math.max(
+                100,
+                Math.min(
+                  MAX_SIMULATION_IONS,
+                  Math.round(Number(e.target.value) || 10000)
+                )
+              )
+            )
+          }
+          className="w-20 bg-transparent text-xs font-mono text-cyan-300 font-bold focus:outline-none"
+        />
+        {[
+          { label: '1k', val: 1000 },
+          { label: '10k', val: 10000 },
+          { label: '100k', val: 100000 },
+          { label: '1M', val: 1000000 },
+        ].map((q) => (
+          <button
+            key={q.val}
+            type="button"
+            onClick={() => setMcIonCount(q.val)}
+            className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+              mcIonCount === q.val
+                ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200 font-bold'
+                : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+            }`}
+          >
+            {q.label}
+          </button>
+        ))}
+      </div>
+
+      {mcRunning ? (
+        <button
+          onClick={stopTrimBenchmark}
+          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold shadow-lg"
+        >
+          <Square className="w-3.5 h-3.5 fill-current" />
+          <span>
+            Stop MC ({mcSnapshot?.completedIons.toLocaleString() || 0} /{' '}
+            {mcIonCount.toLocaleString()})
+          </span>
+        </button>
+      ) : (
+        <button
+          onClick={() => runTrimMonteCarloBenchmark(mcIonCount)}
+          className="flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-xs font-bold shadow-lg"
+        >
+          <Play className="w-3.5 h-3.5 fill-current" />
+          <span>
+            {currentRunMatches
+              ? `Re-Run 3D TRIM MC (${mcSnapshot?.completedIons.toLocaleString()} ions)`
+              : `Run 3D TRIM MC (${mcIonCount.toLocaleString()} Ions)`}
+          </span>
+        </button>
+      )}
+    </div>
+  );
 
   // Build 100-bin depth comparison arrays
   const depthComparison = useMemo(() => {
@@ -727,74 +799,7 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
               </button>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
-              <div className="flex items-center gap-1.5 text-xs bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
-                <span className="text-slate-400 font-semibold">MC Ions:</span>
-                <input
-                  type="number"
-                  min={100}
-                  max={MAX_SIMULATION_IONS}
-                  step={100}
-                  value={mcIonCount}
-                  onChange={(e) =>
-                    setMcIonCount(
-                      Math.max(
-                        100,
-                        Math.min(
-                          MAX_SIMULATION_IONS,
-                          Math.round(Number(e.target.value) || 1000)
-                        )
-                      )
-                    )
-                  }
-                  className="w-20 bg-transparent text-xs font-mono text-cyan-300 font-bold focus:outline-none"
-                />
-                {[
-                  { label: '1k', val: 1000 },
-                  { label: '10k', val: 10000 },
-                  { label: '100k', val: 100000 },
-                  { label: '1M', val: 1000000 },
-                ].map((q) => (
-                  <button
-                    key={q.val}
-                    type="button"
-                    onClick={() => setMcIonCount(q.val)}
-                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
-                      mcIonCount === q.val
-                        ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200 font-bold'
-                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
-                    }`}
-                  >
-                    {q.label}
-                  </button>
-                ))}
-              </div>
-
-              {mcRunning ? (
-                <button
-                  onClick={stopTrimBenchmark}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold shadow-lg"
-                >
-                  <Square className="w-3.5 h-3.5 fill-current" />
-                  <span>
-                    Stop MC ({mcSnapshot?.completedIons.toLocaleString() || 0} /{' '}
-                    {mcIonCount.toLocaleString()})
-                  </span>
-                </button>
-              ) : (
-                <button
-                  onClick={() => runTrimMonteCarloBenchmark(mcIonCount)}
-                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-xs font-bold shadow-lg"
-                >
-                  <Play className="w-3.5 h-3.5 fill-current" />
-                  <span>
-                    {currentRunMatches
-                      ? `Re-Run 3D TRIM MC (${mcSnapshot?.completedIons.toLocaleString()} ions)`
-                      : `Run 3D TRIM MC (${mcIonCount.toLocaleString()} Ions)`}
-                  </span>
-                </button>
-              )}
-            </div>
+            {mcRunnerControls}
           </div>
 
           {/* Side-by-Side Comparison Charts */}
@@ -1036,13 +1041,7 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
                 </div>
               </div>
 
-              <button
-                onClick={() => runTrimMonteCarloBenchmark(500)}
-                className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold"
-              >
-                <Play className="w-3.5 h-3.5 fill-current" />
-                <span>Simulate 500-Ion TRIM MC Profile</span>
-              </button>
+              {mcRunnerControls}
             </div>
 
             <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-7 gap-3 text-xs">
