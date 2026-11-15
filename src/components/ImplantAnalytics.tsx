@@ -1,9 +1,10 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef, useEffect } from 'react';
 import {
   Cpu,
   GitCompare,
   Gauge,
   Play,
+  Square,
   Download,
   FileSpreadsheet,
   Layers,
@@ -13,7 +14,8 @@ import {
 import { getElementByZ } from '../data';
 import { SEMICONDUCTOR_MATERIALS } from '../data/semiconductorMaterials';
 import { calcStoppingAndRangeTable } from '../physics/pral';
-import { TrimSimulator } from '../physics/trim';
+import { MAX_SIMULATION_IONS, TrimSimulator } from '../physics/trim';
+import type { TrimWorkerRequest, TrimWorkerResponse } from '../workers/trim.worker';
 import {
   calcLssCompactRange,
   calcEmpiricalPowerLawRange,
@@ -64,12 +66,24 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
     Math.max(1, trimConfig.ion.energyKeV || 50)
   );
 
-  // Tab 2 Target selection & live MC snapshot
+  // Tab 2 Target selection & live MC snapshot (supports up to 1,000,000 ions)
   const [targetMatId, setTargetMatId] = useState<string>('mat-c-si');
   const [doseCm2, setDoseCm2] = useState<number>(1e15);
   const [useLogScaleY, setUseLogScaleY] = useState<boolean>(true);
+  const [mcIonCount, setMcIonCount] = useState<number>(1000);
   const [mcSnapshot, setMcSnapshot] = useState<TrimSnapshot | null>(null);
   const [mcRunKey, setMcRunKey] = useState<string>('');
+  const [mcRunning, setMcRunning] = useState<boolean>(false);
+  const mcWorkerRef = useRef<Worker | null>(null);
+  const mcCancelRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    return () => {
+      mcCancelRef.current = true;
+      mcWorkerRef.current?.terminate();
+      mcWorkerRef.current = null;
+    };
+  }, []);
 
   // Tab 3 Junction & Sheet Resistance parameters
   const [dopantType, setDopantType] = useState<'n' | 'p'>(() =>
@@ -230,7 +244,18 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
     return { pral, lss, emp };
   }, [selectedIonZ, selectedIonMass, energyKeV, selectedTargetMat]);
 
-  const runTrimMonteCarloBenchmark = (ionCount = 400) => {
+  const stopTrimBenchmark = () => {
+    mcCancelRef.current = true;
+    mcWorkerRef.current?.terminate();
+    mcWorkerRef.current = null;
+    setMcRunning(false);
+  };
+
+  const runTrimMonteCarloBenchmark = (ionCount = mcIonCount) => {
+    const safeCount = Math.max(1, Math.min(MAX_SIMULATION_IONS, Math.round(ionCount)));
+    stopTrimBenchmark();
+    mcCancelRef.current = false;
+
     const estDepthA = Math.max(
       400,
       Math.ceil(
@@ -250,7 +275,7 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
         angleDeg: 0,
       },
       calculationMode: 1,
-      totalIons: ionCount,
+      totalIons: safeCount,
       randomSeed: 98765,
       braggCorrection: 1.0,
       autoSaveNumber: 10000,
@@ -270,10 +295,52 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
         },
       ],
     };
+
+    const runKey = `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}`;
+    const chunkSize = safeCount >= 100_000 ? 10_000 : safeCount >= 10_000 ? 2_500 : 1_000;
+
+    if (typeof Worker !== 'undefined') {
+      try {
+        const w = new Worker(
+          new URL('../workers/trim.worker.ts', import.meta.url),
+          { type: 'module' }
+        );
+        mcWorkerRef.current = w;
+        setMcRunning(true);
+        setMcRunKey(runKey);
+
+        w.onmessage = (e: MessageEvent<TrimWorkerResponse>) => {
+          if (mcCancelRef.current || mcWorkerRef.current !== w) return;
+          if (e.data?.type === 'SNAPSHOT') {
+            const snap = e.data.snapshot;
+            setMcSnapshot(snap);
+            if (snap.completedIons >= safeCount) {
+              setMcRunning(false);
+              w.terminate();
+              mcWorkerRef.current = null;
+            } else {
+              const nextChunk = Math.min(chunkSize, safeCount - snap.completedIons);
+              w.postMessage({ type: 'RUN_BATCH', count: nextChunk } satisfies TrimWorkerRequest);
+            }
+          }
+        };
+        w.postMessage({ type: 'INIT', config: cfg } satisfies TrimWorkerRequest);
+        w.postMessage({
+          type: 'RUN_BATCH',
+          count: Math.min(chunkSize, safeCount),
+        } satisfies TrimWorkerRequest);
+        return;
+      } catch {
+        mcWorkerRef.current = null;
+      }
+    }
+
+    // Fallback when Worker is unavailable
     const sim = new TrimSimulator(cfg);
-    const snap = sim.runBatch(ionCount);
+    const snap = sim.runBatch(safeCount);
     setMcSnapshot(snap);
-    setMcRunKey(`${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}`);
+    setMcRunKey(runKey);
+    setMcRunning(false);
   };
 
   const currentRunMatches =
@@ -660,17 +727,74 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
               </button>
             </div>
 
-            <button
-              onClick={() => runTrimMonteCarloBenchmark(400)}
-              className="flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-xs font-bold shadow-lg"
-            >
-              <Play className="w-3.5 h-3.5 fill-current" />
-              <span>
-                {currentRunMatches
-                  ? `Re-Run 3D TRIM MC (${mcSnapshot?.completedIons} ions)`
-                  : 'Run 3D TRIM MC Benchmark (400 Ions)'}
-              </span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <div className="flex items-center gap-1.5 text-xs bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                <span className="text-slate-400 font-semibold">MC Ions:</span>
+                <input
+                  type="number"
+                  min={100}
+                  max={MAX_SIMULATION_IONS}
+                  step={100}
+                  value={mcIonCount}
+                  onChange={(e) =>
+                    setMcIonCount(
+                      Math.max(
+                        100,
+                        Math.min(
+                          MAX_SIMULATION_IONS,
+                          Math.round(Number(e.target.value) || 1000)
+                        )
+                      )
+                    )
+                  }
+                  className="w-20 bg-transparent text-xs font-mono text-cyan-300 font-bold focus:outline-none"
+                />
+                {[
+                  { label: '1k', val: 1000 },
+                  { label: '10k', val: 10000 },
+                  { label: '100k', val: 100000 },
+                  { label: '1M', val: 1000000 },
+                ].map((q) => (
+                  <button
+                    key={q.val}
+                    type="button"
+                    onClick={() => setMcIonCount(q.val)}
+                    className={`px-1.5 py-0.5 rounded text-[10px] font-mono border ${
+                      mcIonCount === q.val
+                        ? 'bg-emerald-500/20 border-emerald-500/50 text-emerald-200 font-bold'
+                        : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {q.label}
+                  </button>
+                ))}
+              </div>
+
+              {mcRunning ? (
+                <button
+                  onClick={stopTrimBenchmark}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-amber-500 hover:bg-amber-400 text-slate-950 text-xs font-bold shadow-lg"
+                >
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                  <span>
+                    Stop MC ({mcSnapshot?.completedIons.toLocaleString() || 0} /{' '}
+                    {mcIonCount.toLocaleString()})
+                  </span>
+                </button>
+              ) : (
+                <button
+                  onClick={() => runTrimMonteCarloBenchmark(mcIonCount)}
+                  className="flex items-center gap-2 px-4 py-2 rounded-xl bg-gradient-to-r from-emerald-500 to-teal-600 hover:from-emerald-400 hover:to-teal-500 text-white text-xs font-bold shadow-lg"
+                >
+                  <Play className="w-3.5 h-3.5 fill-current" />
+                  <span>
+                    {currentRunMatches
+                      ? `Re-Run 3D TRIM MC (${mcSnapshot?.completedIons.toLocaleString()} ions)`
+                      : `Run 3D TRIM MC (${mcIonCount.toLocaleString()} Ions)`}
+                  </span>
+                </button>
+              )}
+            </div>
           </div>
 
           {/* Side-by-Side Comparison Charts */}

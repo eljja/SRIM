@@ -25,6 +25,14 @@ const MAGIC_C3 = 0.0071222;
 const MAGIC_C4 = 14.813;
 const MAGIC_C5 = 9.3066;
 
+/** Upper bound for Monte Carlo ion histories (supports up to 1,000,000 ions). */
+export const MAX_SIMULATION_IONS = 1_000_000;
+
+/** Fixed surface binding energy sweep grid for O(1)-memory sputtering statistics. */
+const SPUTTER_ES_GRID = [
+  0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0,
+] as const;
+
 /**
  * Deterministic Mulberry32 pseudo-random number generator returning values in (0, 1).
  */
@@ -292,6 +300,58 @@ export function calcMoments(values: number[]): TrimMoments {
 }
 
 /**
+ * Exact O(1)-memory single-pass 4-moment streaming accumulator (Terriberry/Pebay).
+ * Avoids storing million-element coordinate arrays while computing exact mean,
+ * straggling (sigma), skewness, and kurtosis during 1,000,000+ ion runs.
+ */
+export class RunningMoments {
+  private n = 0;
+  private mean = 0.0;
+  private m2 = 0.0;
+  private m3 = 0.0;
+  private m4 = 0.0;
+
+  public get count(): number {
+    return this.n;
+  }
+
+  public push(x: number): void {
+    const n1 = this.n;
+    const n = n1 + 1;
+    this.n = n;
+    const delta = x - this.mean;
+    const deltaN = delta / n;
+    const deltaN2 = deltaN * deltaN;
+    const term1 = delta * deltaN * n1;
+    this.mean += deltaN;
+    this.m4 +=
+      term1 * deltaN2 * (n * n - 3 * n + 3) +
+      6 * deltaN2 * this.m2 -
+      4 * deltaN * this.m3;
+    this.m3 += term1 * deltaN * (n - 2) - 3 * deltaN * this.m2;
+    this.m2 += term1;
+  }
+
+  public getMoments(): TrimMoments {
+    if (this.n === 0) {
+      return { meanA: 0, stragglingA: 0, skewness: 0, kurtosis: 0 };
+    }
+    const variance = Math.max(0, this.m2 / this.n);
+    const stragglingA = Math.sqrt(variance);
+    const skewness =
+      stragglingA > 1e-9 ? (this.m3 / this.n) / Math.pow(stragglingA, 3) : 0.0;
+    const kurtosis =
+      stragglingA > 1e-9 ? (this.m4 / this.n) / (variance * variance) : 3.0;
+    return {
+      meanA: this.mean,
+      stragglingA,
+      skewness,
+      kurtosis,
+    };
+  }
+}
+
+/**
  * Norgett-Robinson-Torrens (NRT) / Lindhard damage partition for Quick Kinchin-Pease Mode 1.
  */
 export function calcQuickKinchinPeaseDamage(
@@ -372,6 +432,9 @@ interface PreparedLayer {
   meanM2: number;
   meanEbEv: number;
   minEsEv: number;
+  totalStoich: number;
+  effectiveCompoundCorr: number;
+  stoppingElements: { z: number; mass: number; stoich: number }[];
   elementProbs: number[];
 }
 
@@ -407,6 +470,9 @@ export class TrimSimulator {
   private totalReplacements = 0;
   private totalInterstitials = 0;
   private escapedRecoilsCount = 0;
+  private totalSputteredCount = 0;
+  private sputteredCountByElem: number[] = [];
+  private sputteredEnergySumByElem: number[] = [];
 
   // Total energy partitions (eV)
   private totalIonizIonEv = 0;
@@ -416,12 +482,11 @@ export class TrimSimulator {
   private totalBindingIonEv = 0;
   private totalBindingRecoilEv = 0;
 
-  // Stopped ion coordinate arrays for exact 4-moment calculation
-  private stoppedDepthsA: number[] = [];
-  private stoppedAbsLatYA: number[] = [];
-  private stoppedLatYA: number[] = [];
-  private stoppedLatZA: number[] = [];
-  private stoppedRadialRA: number[] = [];
+  // O(1)-memory streaming 4-moment accumulators (exact up to 1M+ ions)
+  private rmDepth = new RunningMoments();
+  private rmAbsLatY = new RunningMoments();
+  private rmLatY = new RunningMoments();
+  private rmRadial = new RunningMoments();
 
   // 100-bin depth histograms (raw sums, normalized in getSnapshot)
   private histIonRange = new Array<number>(100).fill(0);
@@ -440,20 +505,39 @@ export class TrimSimulator {
   private histReplacements = new Array<number>(100).fill(0);
   private histInterstitials = new Array<number>(100).fill(0);
 
-  // Records
+  // Bounded display records (up to 1M+ ions without OOM)
+  private static readonly MAX_TRAJECTORIES = 500;
+  private static readonly MAX_STOPPED_MARKERS = 4000;
+  private static readonly MAX_ESCAPED_RECORDS = 2000;
+  private static readonly MAX_SPUTTERED_RECORDS = 2000;
+  private static readonly MAX_COLLISIONS = 500;
+
   private trajectories: TrimTrajectory[] = [];
   private backscatteredIons: TransmittedIonRecord[] = [];
   private transmittedIons: TransmittedIonRecord[] = [];
   private stoppedIons: TransmittedIonRecord[] = [];
   private sputteredAtoms: TrimSputteredAtom[] = [];
-  // All surface candidate arrivals (for sputtering yield vs Es curve)
-  private surfaceArrivalCandidates: { elemIndex: number; normalEnergyEv: number; totalEnergyEv: number }[] = [];
+  // O(1)-memory surface arrival counts [elemIndex][esGridIdx] for sputtering yield vs Es curve
+  private surfaceArrivalCounts: number[][] = [];
   private collisions: TrimCollisionEvent[] = [];
 
   constructor(config: TrimSetupConfig) {
-    this.config = config;
+    this.config = {
+      ...config,
+      totalIons: Math.max(1, Math.min(MAX_SIMULATION_IONS, Math.round(config.totalIons || 1000))),
+    };
     this.rng = createRng(config.randomSeed || 98765);
     this.initGeometry();
+  }
+
+  /**
+   * Updates target ion count mid-run (up to 1,000,000) without discarding progress.
+   */
+  public setTotalIons(totalIons: number): void {
+    this.config.totalIons = Math.max(
+      1,
+      Math.min(MAX_SIMULATION_IONS, Math.round(totalIons || 1))
+    );
   }
 
   private initGeometry(): void {
@@ -506,6 +590,14 @@ export class TrimSimulator {
       const monolayerJumpA = Math.pow(atomDensityPerA3, -1.0 / 3.0);
       const pMaxMonoA = 1.0 / Math.sqrt(Math.PI * atomDensityPerA3 * monolayerJumpA);
 
+      const stoppingElements = layer.elements.map((e) => ({
+        z: e.z,
+        mass: e.massAmu,
+        stoich: e.stoich,
+      }));
+      const effectiveCompoundCorr =
+        layer.compoundCorr * (this.config.braggCorrection || 1.0);
+
       this.preparedLayers.push({
         layer,
         startDepthA,
@@ -517,6 +609,9 @@ export class TrimSimulator {
         meanM2,
         meanEbEv,
         minEsEv,
+        totalStoich,
+        effectiveCompoundCorr,
+        stoppingElements,
         elementProbs: probs,
       });
     }
@@ -539,6 +634,11 @@ export class TrimSimulator {
     this.histVacByElem = this.uniqueElements.map(() =>
       new Array<number>(100).fill(0)
     );
+    this.surfaceArrivalCounts = this.uniqueElements.map(() =>
+      new Array<number>(SPUTTER_ES_GRID.length).fill(0)
+    );
+    this.sputteredCountByElem = new Array<number>(this.uniqueElements.length).fill(0);
+    this.sputteredEnergySumByElem = new Array<number>(this.uniqueElements.length).fill(0);
   }
 
   private getLayerAtDepth(xA: number): PreparedLayer {
@@ -625,7 +725,7 @@ export class TrimSimulator {
       cosZ = ev.cosZ / norm;
     }
 
-    const recordTrack = this.trajectories.length < 200;
+    const recordTrack = this.trajectories.length < TrimSimulator.MAX_TRAJECTORIES;
     const points: TrimPoint3D[] = recordTrack
       ? [{ xA, yA, zA, energyEv }]
       : [];
@@ -708,14 +808,10 @@ export class TrimSimulator {
           z1,
           m1,
           energyEv / 1000.0,
-          pl.layer.elements.map((e) => ({
-            z: e.z,
-            mass: e.massAmu,
-            stoich: e.stoich,
-          })),
+          pl.stoppingElements,
           pl.layer.densityGPerCm3,
           pl.layer.phase,
-          pl.layer.compoundCorr * (this.config.braggCorrection || 1.0),
+          pl.effectiveCompoundCorr,
           1,
           true,
           true
@@ -744,14 +840,10 @@ export class TrimSimulator {
           z1,
           m1,
           energyEv / 1000.0,
-          pl.layer.elements.map((e) => ({
-            z: e.z,
-            mass: e.massAmu,
-            stoich: e.stoich,
-          })),
+          pl.stoppingElements,
           pl.layer.densityGPerCm3,
           pl.layer.phase,
-          pl.layer.compoundCorr * (this.config.braggCorrection || 1.0),
+          pl.effectiveCompoundCorr,
           1,
           true,
           true
@@ -776,14 +868,10 @@ export class TrimSimulator {
         z1,
         m1,
         energyEv / 1000.0,
-        pl.layer.elements.map((e) => ({
-          z: e.z,
-          mass: e.massAmu,
-          stoich: e.stoich,
-        })),
+        pl.stoppingElements,
         pl.layer.densityGPerCm3,
         pl.layer.phase,
-        pl.layer.compoundCorr * (this.config.braggCorrection || 1.0),
+        pl.effectiveCompoundCorr,
         1,
         true,
         true
@@ -1022,12 +1110,11 @@ export class TrimSimulator {
     // Record final ion fate
     if (fate === 'stopped') {
       this.stoppedCount += 1;
-      this.stoppedDepthsA.push(xA);
-      this.stoppedAbsLatYA.push(Math.abs(yA));
-      this.stoppedLatYA.push(yA);
-      this.stoppedLatZA.push(zA);
+      this.rmDepth.push(xA);
+      this.rmAbsLatY.push(Math.abs(yA));
+      this.rmLatY.push(yA);
       const radR = Math.sqrt(yA * yA + zA * zA);
-      this.stoppedRadialRA.push(radR);
+      this.rmRadial.push(radR);
 
       const bin = this.depthToBin(xA);
       if (bin >= 0) {
@@ -1036,7 +1123,7 @@ export class TrimSimulator {
         this.histLatZ[bin] += Math.abs(zA);
         this.histRadialR[bin] += radR;
       }
-      if (this.stoppedIons.length < 1000) {
+      if (this.stoppedIons.length < TrimSimulator.MAX_STOPPED_MARKERS) {
         this.stoppedIons.push({
           ionNumber,
           z1,
@@ -1048,10 +1135,26 @@ export class TrimSimulator {
           cosY,
           cosZ,
         });
+      } else {
+        // Reservoir sampling keeps the displayed 3D marker cloud unbiased across 1,000,000 ions
+        const replaceIdx = Math.floor(this.rng() * this.stoppedCount);
+        if (replaceIdx < TrimSimulator.MAX_STOPPED_MARKERS) {
+          this.stoppedIons[replaceIdx] = {
+            ionNumber,
+            z1,
+            energyEv: 0,
+            xA,
+            yA,
+            zA,
+            cosX,
+            cosY,
+            cosZ,
+          };
+        }
       }
     } else if (fate === 'backscattered') {
       this.backscatteredCount += 1;
-      if (this.backscatteredIons.length < 1000) {
+      if (this.backscatteredIons.length < TrimSimulator.MAX_ESCAPED_RECORDS) {
         this.backscatteredIons.push({
           ionNumber,
           z1,
@@ -1066,7 +1169,7 @@ export class TrimSimulator {
       }
     } else if (fate === 'transmitted') {
       this.transmittedCount += 1;
-      if (this.transmittedIons.length < 1000) {
+      if (this.transmittedIons.length < TrimSimulator.MAX_ESCAPED_RECORDS) {
         this.transmittedIons.push({
           ionNumber,
           z1,
@@ -1197,8 +1300,7 @@ export class TrimSimulator {
 
         // Electronic stopping of recoil over jumpA using Bragg's rule sum
         let seEvPerA = 0.0;
-        const totalStoich =
-          pl.layer.elements.reduce((acc, el) => acc + Math.max(0, el.stoich), 0) || 1.0;
+        const totalStoich = pl.totalStoich;
         for (const el of pl.layer.elements) {
           const frac = Math.max(0, el.stoich) / totalStoich;
           if (frac <= 0) continue;
@@ -1223,11 +1325,14 @@ export class TrimSimulator {
         // Check if recoil reaches the surface (x <= 0 -> candidate for Sputtering!)
         if (nextXA <= 0.0) {
           const normalEnergyEv = rec.energyEv * rec.cosX * rec.cosX;
-          this.surfaceArrivalCandidates.push({
-            elemIndex: recElemIdx,
-            normalEnergyEv,
-            totalEnergyEv: rec.energyEv,
-          });
+          const arrRow = this.surfaceArrivalCounts[recElemIdx];
+          if (arrRow) {
+            for (let g = 0; g < SPUTTER_ES_GRID.length; g++) {
+              if (normalEnergyEv > SPUTTER_ES_GRID[g]) {
+                arrRow[g] += 1;
+              }
+            }
+          }
 
           if (normalEnergyEv > esEv) {
             // Sputtered atom escapes planar surface barrier Es!
@@ -1235,6 +1340,11 @@ export class TrimSimulator {
               this.escapedRecoilsCount += 1;
             }
             const escapedEnergyEv = Math.max(0.01, rec.energyEv - esEv);
+            this.totalSputteredCount += 1;
+            this.sputteredCountByElem[recElemIdx] =
+              (this.sputteredCountByElem[recElemIdx] ?? 0) + 1;
+            this.sputteredEnergySumByElem[recElemIdx] =
+              (this.sputteredEnergySumByElem[recElemIdx] ?? 0) + escapedEnergyEv;
             const refractCosX = -Math.sqrt(
               Math.max(
                 0.0,
@@ -1248,7 +1358,7 @@ export class TrimSimulator {
                   Math.max(1e-9, 1.0 - rec.cosX * rec.cosX)
               )
             );
-            if (this.sputteredAtoms.length < 2000) {
+            if (this.sputteredAtoms.length < TrimSimulator.MAX_SPUTTERED_RECORDS) {
               this.sputteredAtoms.push({
                 ionNumber,
                 z2: rec.z,
@@ -1465,36 +1575,30 @@ export class TrimSimulator {
     const energyBindingByIonPct = (this.totalBindingIonEv * 100.0) / safeTotalEv;
     const energyBindingByRecoilPct = (this.totalBindingRecoilEv * 100.0) / safeTotalEv;
 
-    // Sputtering yield by element & SBE curve
-    const sputterByElem = this.uniqueElements.map((el) => {
-      const matching = this.sputteredAtoms.filter((s) => s.z2 === el.z);
-      const meanE =
-        matching.length > 0
-          ? matching.reduce((acc, s) => acc + s.energyEv, 0) / matching.length
-          : 0;
+    // Sputtering yield by element & SBE curve (exact counters up to 1M+ ions)
+    const sputterByElem = this.uniqueElements.map((el, elemIdx) => {
+      const cnt = this.sputteredCountByElem[elemIdx] ?? 0;
+      const eSum = this.sputteredEnergySumByElem[elemIdx] ?? 0;
       return {
         z: el.z,
         symbol: el.symbol,
         name: el.name,
-        yieldPerIon: matching.length / nIons,
-        meanEnergyEv: meanE,
+        yieldPerIon: cnt / nIons,
+        meanEnergyEv: cnt > 0 ? eSum / cnt : 0,
       };
     });
 
-    const esGrid = [0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 10.0, 12.0];
-    const sputterYieldVsEs = esGrid.map((esEv) => {
-      const byElement = this.uniqueElements.map((_, idx) => {
-        let cnt = 0;
-        for (const cand of this.surfaceArrivalCandidates) {
-          if (cand.elemIndex === idx && cand.normalEnergyEv > esEv) {
-            cnt++;
-          }
-        }
+    const sputterYieldVsEs = SPUTTER_ES_GRID.map((esEv, gIdx) => {
+      const byElement = this.uniqueElements.map((_, elemIdx) => {
+        const cnt = this.surfaceArrivalCounts[elemIdx]?.[gIdx] ?? 0;
         return cnt / nIons;
       });
       const totalYield = byElement.reduce((a, b) => a + b, 0);
       return { esEv, totalYield, byElement };
     });
+
+    const absLatM = this.rmAbsLatY.getMoments();
+    const latM = this.rmLatY.getMoments();
 
     return {
       completedIons: this.completedIons,
@@ -1514,7 +1618,7 @@ export class TrimSimulator {
       displacementsPerIon: this.totalDisplacements / nIons,
       replacementsPerIon: this.totalReplacements / nIons,
       interstitialsPerIon: this.totalInterstitials / nIons,
-      sputteringYield: this.sputteredAtoms.length / nIons,
+      sputteringYield: this.totalSputteredCount / nIons,
       sputteringYieldByElement: sputterByElem,
       sputterYieldVsEs,
       energyLossIonizationPct: energyIonizByIonPct + energyIonizByRecoilPct,
@@ -1526,14 +1630,14 @@ export class TrimSimulator {
       energyPhononByRecoilPct,
       energyBindingByIonPct,
       energyBindingByRecoilPct,
-      rangeMoments: calcMoments(this.stoppedDepthsA),
+      rangeMoments: this.rmDepth.getMoments(),
       lateralMoments: {
-        meanA: calcMoments(this.stoppedAbsLatYA).meanA,
-        stragglingA: calcMoments(this.stoppedLatYA).stragglingA,
-        skewness: calcMoments(this.stoppedLatYA).skewness,
-        kurtosis: calcMoments(this.stoppedLatYA).kurtosis,
+        meanA: absLatM.meanA,
+        stragglingA: latM.stragglingA,
+        skewness: latM.skewness,
+        kurtosis: latM.kurtosis,
       },
-      radialMoments: calcMoments(this.stoppedRadialRA),
+      radialMoments: this.rmRadial.getMoments(),
       binWidthA: this.binWidthA,
       binDepthsA: this.binDepthsA,
       histograms: {

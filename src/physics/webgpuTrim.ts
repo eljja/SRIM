@@ -173,8 +173,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     atomicAdd(&histBins[binIdx], 1u);
   }
 
-  // Record stopped ion coordinates (up to 1024 ions)
-  if (ionIdx < 1024u) {
+  // Record stopped ion coordinates (up to 4096 ions per batch)
+  if (ionIdx < 4096u) {
     stoppedIons[ionIdx].x = x;
     stoppedIons[ionIdx].y = y;
     stoppedIons[ionIdx].z = z;
@@ -233,7 +233,8 @@ export class WebGpuTrimRunner {
       throw new Error('WebGPU not initialized or supported in this environment');
     }
 
-    const nIons = Math.max(1, Math.min(65535, count));
+    // 1 dispatch supports up to 65,535 * 64 = 4.19M ions; allow up to 1,000,000 ions per batch
+    const nIons = Math.max(1, Math.min(1_000_000, Math.round(count)));
 
     // 1. Uniform Buffer: 64 bytes
     const uniformArray = new Float32Array(16);
@@ -265,8 +266,8 @@ export class WebGpuTrimRunner {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
-    // 3. Stopped ions buffer: 1024 * 16 = 16384 bytes
-    const maxIonsToRecord = Math.min(1024, nIons);
+    // 3. Stopped ions buffer: up to 4096 * 16 = 65536 bytes
+    const maxIonsToRecord = Math.min(4096, nIons);
     const stoppedBufferSize = maxIonsToRecord * 16;
     const stoppedBuffer = this.device.createBuffer({
       size: stoppedBufferSize,

@@ -2,6 +2,9 @@ import { describe, it, expect } from 'vitest';
 import {
   createRng,
   calcMagicScattering,
+  calcMoments,
+  RunningMoments,
+  MAX_SIMULATION_IONS,
   TrimSimulator,
 } from './trim';
 import type { TrimSetupConfig } from './types';
@@ -251,5 +254,80 @@ describe('TRIM-2003 3D Monte Carlo BCA Simulation Engine', () => {
     expect(snap.trajectories[0].z1).toBe(5);
     expect(snap.trajectories[1].z1).toBe(6);
     expect(snap.trajectories[2].z1).toBe(7);
+  });
+
+  it('matches batch calcMoments to <1e-7 relative accuracy using O(1)-memory RunningMoments', () => {
+    const rng = createRng(2026);
+    const values: number[] = [];
+    const running = new RunningMoments();
+    for (let i = 0; i < 5000; i++) {
+      // Skewed distribution representative of ion range profiles
+      const x = 120.0 + 45.0 * (rng() - 0.3) + 60.0 * Math.pow(rng(), 3);
+      values.push(x);
+      running.push(x);
+    }
+
+    const exact = calcMoments(values);
+    const streamed = running.getMoments();
+
+    expect(running.count).toBe(5000);
+    expect(streamed.meanA).toBeCloseTo(exact.meanA, 6);
+    expect(streamed.stragglingA).toBeCloseTo(exact.stragglingA, 6);
+    expect(streamed.skewness).toBeCloseTo(exact.skewness, 5);
+    expect(streamed.kurtosis).toBeCloseTo(exact.kurtosis, 5);
+  });
+
+  it('supports extending totalIons up to 1,000,000 cleanly in O(1) snapshot memory', () => {
+    expect(MAX_SIMULATION_IONS).toBe(1_000_000);
+
+    const config: TrimSetupConfig = {
+      title: '1M Scalability Check',
+      ion: { z1: 5, symbol: 'B', name: 'Boron', massAmu: 10.811, energyKeV: 10.0, angleDeg: 0 },
+      calculationMode: 1,
+      totalIons: 300,
+      randomSeed: 777,
+      braggCorrection: 1.0,
+      autoSaveNumber: 10000,
+      plotType: 0,
+      plotXMinA: 0,
+      plotXMaxA: 2000,
+      zones: [{ layerIndex: 0, endDepthA: 2000 }],
+      layers: [
+        {
+          id: 'si-layer',
+          name: 'Si',
+          widthA: 2000,
+          densityGPerCm3: 2.3212,
+          phase: 0,
+          compoundCorr: 1.0,
+          elements: [
+            {
+              z: 14,
+              symbol: 'Si',
+              name: 'Silicon',
+              stoich: 1.0,
+              massAmu: 28.086,
+              displacementEv: 15.0,
+              latticeBindingEv: 2.0,
+              surfaceBindingEv: 4.7,
+            },
+          ],
+        },
+      ],
+    };
+
+    const sim = new TrimSimulator(config);
+    const snap1 = sim.runBatch(300);
+    expect(snap1.completedIons).toBe(300);
+
+    // Raise target to 1,000,000 mid-run without discarding already simulated ions
+    sim.setTotalIons(1_000_000);
+    const snap2 = sim.runBatch(1200);
+    expect(snap2.totalIons).toBe(1_000_000);
+    expect(snap2.completedIons).toBe(1500);
+    // Display buffers stay strictly bounded even as N grows large
+    expect(snap2.trajectories.length).toBeLessThanOrEqual(500);
+    expect(snap2.stoppedIons.length).toBeLessThanOrEqual(4000);
+    expect(snap2.rangeMoments.meanA).toBeGreaterThan(200);
   });
 });

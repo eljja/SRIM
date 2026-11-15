@@ -76,7 +76,7 @@ function buildPreset(seed: PresetSeed): SemiconductorPreset {
         angleDeg: seed.angleDeg,
       },
       calculationMode: seed.calculationMode,
-      totalIons: seed.totalIons ?? 300,
+      totalIons: seed.totalIons ?? 1000,
       randomSeed: 98765,
       braggCorrection: 1.0,
       autoSaveNumber: 10000,
@@ -402,7 +402,7 @@ const PRESET_SEEDS: PresetSeed[] = [
     energyKeV: 30.0,
     angleDeg: 0.0,
     calculationMode: 3,
-    totalIons: 200,
+    totalIons: 1000,
     layers: [
       { matId: 'mat-cu', widthA: 400, name: 'Cu Interconnect' },
       { matId: 'mat-th-sio2', widthA: 800, name: 'IMD SiO2' },

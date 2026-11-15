@@ -572,22 +572,49 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
 
               <div>
                 <label className="block text-[11px] text-slate-400 mb-1">
-                  Total Ions to Simulate
+                  Total Ions to Simulate (Max 1,000,000)
                 </label>
                 <input
                   type="number"
-                  step="50"
+                  step="100"
                   min={1}
-                  max={100000}
+                  max={1000000}
                   value={config.totalIons}
                   onChange={(e) =>
                     onChangeConfig({
                       ...config,
-                      totalIons: Math.max(1, Math.round(Number(e.target.value))),
+                      totalIons: Math.min(
+                        1000000,
+                        Math.max(1, Math.round(Number(e.target.value) || 1))
+                      ),
                     })
                   }
                   className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white font-mono"
                 />
+                <div className="flex flex-wrap gap-1 mt-1.5">
+                  {[
+                    { label: '100', val: 100 },
+                    { label: '1k', val: 1000 },
+                    { label: '10k', val: 10000 },
+                    { label: '100k', val: 100000 },
+                    { label: '1M', val: 1000000 },
+                  ].map((q) => (
+                    <button
+                      key={q.val}
+                      type="button"
+                      onClick={() =>
+                        onChangeConfig({ ...config, totalIons: q.val })
+                      }
+                      className={`px-2 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                        config.totalIons === q.val
+                          ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-200 font-bold'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div>

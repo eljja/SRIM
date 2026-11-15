@@ -22,7 +22,7 @@ const DEFAULT_TRIM_CONFIG: TrimSetupConfig = {
     angleDeg: 0.0,
   },
   calculationMode: 1,
-  totalIons: 250,
+  totalIons: 1000,
   randomSeed: 98765,
   braggCorrection: 1.0,
   autoSaveNumber: 10000,
@@ -129,7 +129,14 @@ export function App() {
           />
         )}
 
-        {activeModule === 'cockpit' && <TrimCockpit config={trimConfig} />}
+        {activeModule === 'cockpit' && (
+          <TrimCockpit
+            config={trimConfig}
+            onUpdateTotalIons={(nextTotal) =>
+              setTrimConfig((prev) => ({ ...prev, totalIons: nextTotal }))
+            }
+          />
+        )}
 
         {activeModule === 'sr' && <SrCalculator trimConfig={trimConfig} />}
 

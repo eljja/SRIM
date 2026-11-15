@@ -27,6 +27,7 @@ import type { TrimWorkerRequest, TrimWorkerResponse } from '../workers/trim.work
 
 interface TrimCockpitProps {
   config: TrimSetupConfig;
+  onUpdateTotalIons?: (totalIons: number) => void;
 }
 
 type CockpitTab =
@@ -41,7 +42,10 @@ type CockpitTab =
   | 'transmit'
   | 'outputs';
 
-export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
+export const TrimCockpit: React.FC<TrimCockpitProps> = ({
+  config,
+  onUpdateTotalIons,
+}) => {
   const simRef = useRef<TrimSimulator>(new TrimSimulator(config));
   const workerRef = useRef<Worker | null>(null);
   const gpuRunnerRef = useRef<WebGpuTrimRunner | null>(null);
@@ -50,7 +54,7 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
     simRef.current.getSnapshot()
   );
   const [isRunning, setIsRunning] = useState<boolean>(false);
-  const [batchSpeed, setBatchSpeed] = useState<number>(10);
+  const [batchSpeed, setBatchSpeed] = useState<number>(100);
   const [activeTab, setActiveTab] = useState<CockpitTab>('range');
   const [transmitBinWidthDeg, setTransmitBinWidthDeg] = useState<number>(2.0);
   const [selectedTxtFile, setSelectedTxtFile] = useState<string>('TDATA.TXT');
@@ -59,13 +63,54 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
   const [gpuSupported, setGpuSupported] = useState<boolean>(false);
   const [webGpuEnabled, setWebGpuEnabled] = useState<boolean>(false);
 
+  const configRef = useRef(config);
+  configRef.current = config;
+  const isRunningRef = useRef(isRunning);
+  isRunningRef.current = isRunning;
+  const batchSpeedRef = useRef(batchSpeed);
+  batchSpeedRef.current = batchSpeed;
+  const webGpuEnabledRef = useRef(webGpuEnabled);
+  webGpuEnabledRef.current = webGpuEnabled;
+  const inFlightRef = useRef<boolean>(false);
+
   useEffect(() => {
     setGpuSupported(isWebGpuSupported());
   }, []);
 
-  // Re-initialize simulator or worker when config changes
+  // Structural simulation key excluding totalIons so raising target ions up to 1,000,000 preserves progress
+  const structuralSimKey = useMemo(
+    () =>
+      JSON.stringify({
+        ion: config.ion,
+        calculationMode: config.calculationMode,
+        randomSeed: config.randomSeed,
+        braggCorrection: config.braggCorrection,
+        plotXMinA: config.plotXMinA,
+        plotXMaxA: config.plotXMaxA,
+        layers: config.layers,
+        customTrimDatEvents: config.customTrimDatEvents,
+      }),
+    [config]
+  );
+
+  // Sync totalIons updates mid-run without resetting completed ions
+  useEffect(() => {
+    if (workerRef.current) {
+      workerRef.current.postMessage({
+        type: 'SET_TOTAL_IONS',
+        totalIons: config.totalIons,
+      } satisfies TrimWorkerRequest);
+    } else {
+      simRef.current.setTotalIons(config.totalIons);
+      setSnapshot(simRef.current.getSnapshot());
+    }
+  }, [config.totalIons]);
+
+  // Re-initialize simulator or worker only when structural target/ion/physics config changes
   useEffect(() => {
     setIsRunning(false);
+    inFlightRef.current = false;
+    const activeConfig = configRef.current;
 
     try {
       if (typeof Worker !== 'undefined') {
@@ -74,34 +119,65 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
           { type: 'module' }
         );
         w.onmessage = (e: MessageEvent<TrimWorkerResponse>) => {
+          inFlightRef.current = false;
           if (e.data?.type === 'SNAPSHOT') {
-            setSnapshot(e.data.snapshot);
-            if (e.data.snapshot.completedIons >= config.totalIons) {
+            const snap = e.data.snapshot;
+            setSnapshot(snap);
+            if (snap.completedIons >= configRef.current.totalIons) {
               setIsRunning(false);
+            } else if (isRunningRef.current && !webGpuEnabledRef.current) {
+              const remaining = configRef.current.totalIons - snap.completedIons;
+              const nextBatch = Math.max(
+                1,
+                Math.min(batchSpeedRef.current, remaining)
+              );
+              window.setTimeout(() => {
+                if (
+                  workerRef.current === w &&
+                  isRunningRef.current &&
+                  !webGpuEnabledRef.current &&
+                  !inFlightRef.current
+                ) {
+                  inFlightRef.current = true;
+                  w.postMessage({
+                    type: 'RUN_BATCH',
+                    count: nextBatch,
+                  } satisfies TrimWorkerRequest);
+                }
+              }, 8);
             }
           }
         };
         workerRef.current = w;
-        w.postMessage({ type: 'INIT', config } satisfies TrimWorkerRequest);
-        // Run initial batch
-        const initialCount = Math.min(15, config.totalIons);
-        w.postMessage({ type: 'RUN_BATCH', count: initialCount } satisfies TrimWorkerRequest);
+        w.postMessage({
+          type: 'INIT',
+          config: activeConfig,
+        } satisfies TrimWorkerRequest);
+        // Run initial preview batch
+        const initialCount = Math.min(25, activeConfig.totalIons);
+        inFlightRef.current = true;
+        w.postMessage({
+          type: 'RUN_BATCH',
+          count: initialCount,
+        } satisfies TrimWorkerRequest);
       }
     } catch {
       workerRef.current = null;
+      inFlightRef.current = false;
     }
 
     if (!workerRef.current) {
-      simRef.current = new TrimSimulator(config);
-      const initialCount = Math.min(15, config.totalIons);
+      simRef.current = new TrimSimulator(activeConfig);
+      const initialCount = Math.min(25, activeConfig.totalIons);
       setSnapshot(simRef.current.runBatch(initialCount));
     }
 
     return () => {
+      inFlightRef.current = false;
       workerRef.current?.terminate();
       workerRef.current = null;
     };
-  }, [config]);
+  }, [structuralSimKey]);
 
   const handleToggleWebGpu = async () => {
     if (!webGpuEnabled) {
@@ -124,22 +200,27 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
     }
   };
 
-  // Animation loop when running
+  // Start / resume Monte Carlo loop when isRunning flips true
   useEffect(() => {
     if (!isRunning) return;
+    let cancelled = false;
     let timerId = 0;
-    const stepLoop = () => {
-      if (snapshot.completedIons >= config.totalIons) {
+
+    const kickLoop = () => {
+      if (cancelled || !isRunningRef.current) return;
+      const remaining = configRef.current.totalIons - snapshot.completedIons;
+      if (remaining <= 0) {
         setIsRunning(false);
         return;
       }
 
       if (webGpuEnabled && gpuRunnerRef.current?.ready) {
+        const dispatchCount = Math.min(batchSpeedRef.current, remaining);
         const l0 = config.layers[0];
         const el0 = l0?.elements[0];
         const totalW = config.layers.reduce((a, b) => a + b.widthA, 0) || 1000;
         gpuRunnerRef.current
-          .runBatch(batchSpeed, {
+          .runBatch(dispatchCount, {
             z1: config.ion.z1,
             m1: config.ion.massAmu,
             energyEv: config.ion.energyKeV * 1000.0,
@@ -153,11 +234,12 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
             binWidthA: snapshot.binWidthA || 10,
           })
           .then((res) => {
+            if (cancelled) return;
             setSnapshot((prev) => {
-              const nextCompleted = prev.completedIons + batchSpeed;
+              const nextCompleted = prev.completedIons + dispatchCount;
               const newStoppedIons = [...prev.stoppedIons];
               for (let i = 0; i < res.stoppedX.length; i++) {
-                if (newStoppedIons.length < 1000) {
+                if (newStoppedIons.length < 4000) {
                   newStoppedIons.push({
                     ionNumber: prev.completedIons + i + 1,
                     z1: config.ion.z1,
@@ -171,20 +253,53 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
                   });
                 }
               }
+              const oldNorm = 1e8 / (Math.max(1, prev.completedIons) * prev.binWidthA);
               const rangeNormCmInv = 1e8 / (Math.max(1, nextCompleted) * prev.binWidthA);
-              const mergedHist = prev.histograms.ionRange.map((oldVal, b) => {
-                const oldCounts = (oldVal / rangeNormCmInv) * prev.completedIons;
-                return (
-                  ((oldCounts + (res.rangeHist[b] || 0)) / nextCompleted) *
-                  rangeNormCmInv
-                );
-              });
+              const mergedCounts = prev.histograms.ionRange.map(
+                (oldVal, b) => (oldVal / oldNorm) + (res.rangeHist[b] || 0)
+              );
+              const mergedHist = mergedCounts.map((c) => c * rangeNormCmInv);
+              // Compute range moments from histogram bin centers
+              let countSum = 0;
+              let sumX = 0;
+              for (let b = 0; b < mergedCounts.length; b++) {
+                countSum += mergedCounts[b];
+                sumX += mergedCounts[b] * (prev.binDepthsA[b] || 0);
+              }
+              const meanA = countSum > 0 ? sumX / countSum : prev.rangeMoments.meanA;
+              let m2 = 0;
+              let m3 = 0;
+              let m4 = 0;
+              if (countSum > 0) {
+                for (let b = 0; b < mergedCounts.length; b++) {
+                  const d = (prev.binDepthsA[b] || 0) - meanA;
+                  const c = mergedCounts[b];
+                  m2 += c * d * d;
+                  m3 += c * d * d * d;
+                  m4 += c * d * d * d * d;
+                }
+                m2 /= countSum;
+                m3 /= countSum;
+                m4 /= countSum;
+              }
+              const stragglingA = Math.sqrt(Math.max(0, m2));
+              const skewness =
+                stragglingA > 1e-9 ? m3 / Math.pow(stragglingA, 3) : 0;
+              const kurtosis =
+                stragglingA > 1e-9 ? m4 / Math.pow(stragglingA, 4) : 3;
+
               return {
                 ...prev,
                 completedIons: nextCompleted,
                 stoppedCount: prev.stoppedCount + res.stoppedCount,
                 backscatteredCount: prev.backscatteredCount + res.backscatterCount,
                 transmittedCount: prev.transmittedCount + res.transmitCount,
+                stoppedPct: ((prev.stoppedCount + res.stoppedCount) * 100) / nextCompleted,
+                backscatteredPct:
+                  ((prev.backscatteredCount + res.backscatterCount) * 100) / nextCompleted,
+                transmittedPct:
+                  ((prev.transmittedCount + res.transmitCount) * 100) / nextCompleted,
+                rangeMoments: { meanA, stragglingA, skewness, kurtosis },
                 stoppedIons: newStoppedIons,
                 histograms: {
                   ...prev.histograms,
@@ -192,44 +307,56 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
                 },
               };
             });
-            timerId = window.setTimeout(stepLoop, 20);
+            timerId = window.setTimeout(kickLoop, 16);
           })
           .catch(() => {
             setWebGpuEnabled(false);
-            timerId = window.setTimeout(stepLoop, 25);
+            timerId = window.setTimeout(kickLoop, 20);
           });
         return;
       }
 
       if (workerRef.current) {
-        workerRef.current.postMessage({
-          type: 'RUN_BATCH',
-          count: batchSpeed,
-        } satisfies TrimWorkerRequest);
-        timerId = window.setTimeout(stepLoop, 25);
+        if (!inFlightRef.current) {
+          inFlightRef.current = true;
+          workerRef.current.postMessage({
+            type: 'RUN_BATCH',
+            count: Math.min(batchSpeedRef.current, remaining),
+          } satisfies TrimWorkerRequest);
+        }
       } else {
-        const snap = simRef.current.runBatch(batchSpeed);
+        const snap = simRef.current.runBatch(
+          Math.min(batchSpeedRef.current, remaining)
+        );
         setSnapshot({ ...snap });
-        if (snap.completedIons >= config.totalIons) {
+        if (snap.completedIons >= configRef.current.totalIons) {
           setIsRunning(false);
         } else {
-          timerId = window.setTimeout(stepLoop, 25);
+          timerId = window.setTimeout(kickLoop, 16);
         }
       }
     };
-    timerId = window.setTimeout(stepLoop, 25);
-    return () => clearTimeout(timerId);
-  }, [isRunning, batchSpeed, config.totalIons, snapshot.completedIons, webGpuEnabled]);
+
+    timerId = window.setTimeout(kickLoop, 12);
+    return () => {
+      cancelled = true;
+      clearTimeout(timerId);
+    };
+  }, [isRunning, webGpuEnabled]);
 
   const handleStep = (n: number) => {
     setIsRunning(false);
+    const remaining = Math.max(0, config.totalIons - snapshot.completedIons);
+    const stepCount = Math.min(n, remaining);
+    if (stepCount <= 0) return;
     if (workerRef.current) {
+      inFlightRef.current = true;
       workerRef.current.postMessage({
         type: 'RUN_BATCH',
-        count: n,
+        count: stepCount,
       } satisfies TrimWorkerRequest);
     } else {
-      const snap = simRef.current.runBatch(n);
+      const snap = simRef.current.runBatch(stepCount);
       setSnapshot({ ...snap });
     }
   };
@@ -334,12 +461,12 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
           </button>
 
           <button
-            onClick={() => handleStep(50)}
+            onClick={() => handleStep(100)}
             disabled={snapshot.completedIons >= config.totalIons}
             className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-xs font-semibold text-slate-200 border border-slate-700 disabled:opacity-40"
           >
             <StepForward className="w-3.5 h-3.5 text-emerald-400" />
-            <span>+50 Ions</span>
+            <span>+100 Ions</span>
           </button>
 
           <button
@@ -357,10 +484,12 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
               onChange={(e) => setBatchSpeed(Number(e.target.value))}
               className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-xs text-white"
             >
-              <option value={2}>2 Ions / tick</option>
               <option value={10}>10 Ions / tick</option>
-              <option value={25}>25 Ions / tick</option>
-              <option value={100}>100 Ions / tick (Turbo)</option>
+              <option value={100}>100 Ions / tick</option>
+              <option value={500}>500 Ions / tick</option>
+              <option value={2000}>2,000 Ions / tick (Fast)</option>
+              <option value={10000}>10,000 Ions / tick (Turbo)</option>
+              <option value={25000}>25,000 Ions / tick (1M Ultra)</option>
             </select>
           </div>
 
@@ -393,16 +522,66 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({ config }) => {
           </button>
         </div>
 
-        {/* Progress Bar & Status */}
-        <div className="flex-1 min-w-[260px] max-w-[440px]">
-          <div className="flex justify-between text-xs mb-1">
+        {/* Progress Bar & Inline Target Ions (Up to 1,000,000) */}
+        <div className="flex-1 min-w-[280px] max-w-[520px] space-y-1.5">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
             <span className="text-slate-300 font-semibold">
-              Ion History Progress: {snapshot.completedIons.toLocaleString()} /{' '}
+              Ion History: {snapshot.completedIons.toLocaleString()} /{' '}
               {config.totalIons.toLocaleString()}
             </span>
-            <span className="font-mono text-cyan-400 font-bold">
-              {progressPct.toFixed(1)}%
-            </span>
+            <div className="flex items-center gap-1">
+              {onUpdateTotalIons && (
+                <>
+                  <input
+                    type="number"
+                    min={1}
+                    max={1000000}
+                    step={100}
+                    value={config.totalIons}
+                    onChange={(e) => {
+                      const next = Math.min(
+                        1000000,
+                        Math.max(1, Math.round(Number(e.target.value) || 1))
+                      );
+                      onUpdateTotalIons(next);
+                    }}
+                    title="Target Total Ions (1 to 1,000,000)"
+                    className="w-24 bg-slate-950 border border-slate-700 rounded px-1.5 py-0.5 text-[11px] font-mono text-cyan-300 font-bold"
+                  />
+                  {[
+                    { label: '1k', val: 1000 },
+                    { label: '10k', val: 10000 },
+                    { label: '100k', val: 100000 },
+                    { label: '1M', val: 1000000 },
+                  ].map((q) => (
+                    <button
+                      key={q.val}
+                      type="button"
+                      onClick={() => {
+                        onUpdateTotalIons(q.val);
+                        if (q.val >= 1000000 && batchSpeed < 10000) {
+                          setBatchSpeed(25000);
+                        } else if (q.val >= 100000 && batchSpeed < 2000) {
+                          setBatchSpeed(10000);
+                        } else if (q.val >= 10000 && batchSpeed < 500) {
+                          setBatchSpeed(2000);
+                        }
+                      }}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono border transition-colors ${
+                        config.totalIons === q.val
+                          ? 'bg-cyan-500/20 border-cyan-500/50 text-cyan-200 font-bold'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {q.label}
+                    </button>
+                  ))}
+                </>
+              )}
+              <span className="font-mono text-cyan-400 font-bold ml-1">
+                {progressPct.toFixed(1)}%
+              </span>
+            </div>
           </div>
           <div className="h-2.5 w-full rounded-full bg-slate-950 border border-slate-800 overflow-hidden">
             <div
