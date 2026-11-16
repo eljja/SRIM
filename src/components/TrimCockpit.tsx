@@ -19,14 +19,29 @@ import { TrimSimulator } from '../physics/trim';
 import { calcEsumAnalysis, calcTransmitAnalysis } from '../physics/pral';
 import { generateAllTrimOutputs } from '../physics/formats';
 import { generateSvgLinePlot, generateCsvData, downloadFile } from '../physics/exportUtils';
-import { isWebGpuSupported, WebGpuTrimRunner } from '../physics/webgpuTrim';
+import {
+  buildGpuStoppingTable,
+  isWebGpuSupported,
+  WebGpuTrimRunner,
+} from '../physics/webgpuTrim';
+import {
+  DEFAULT_ADVANCED_PHYSICS,
+  inferCrystalPresetForLayer,
+} from '../physics/advancedPhysics';
 import { TrajectoryViewer3D } from './TrajectoryViewer3D';
 import { ContourMap2D } from './ContourMap2D';
-import type { TrimSetupConfig, TrimSnapshot } from '../physics/types';
+import type {
+  CrystalOrientation,
+  ScreeningPotentialType,
+  TrimAdvancedPhysicsConfig,
+  TrimSetupConfig,
+  TrimSnapshot,
+} from '../physics/types';
 import type { TrimWorkerRequest, TrimWorkerResponse } from '../workers/trim.worker';
 
 interface TrimCockpitProps {
   config: TrimSetupConfig;
+  onUpdateConfig?: (next: TrimSetupConfig) => void;
   onUpdateTotalIons?: (totalIons: number) => void;
 }
 
@@ -44,6 +59,7 @@ type CockpitTab =
 
 export const TrimCockpit: React.FC<TrimCockpitProps> = ({
   config,
+  onUpdateConfig,
   onUpdateTotalIons,
 }) => {
   const simRef = useRef<TrimSimulator>(new TrimSimulator(config));
@@ -89,9 +105,37 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
         plotXMaxA: config.plotXMaxA,
         layers: config.layers,
         customTrimDatEvents: config.customTrimDatEvents,
+        advancedPhysics: config.advancedPhysics,
       }),
     [config]
   );
+
+  // Precompute exact tabulated SCOEF03 Se(E) LUT for full-fidelity WebGPU dispatch
+  const gpuLut = useMemo(() => buildGpuStoppingTable(config), [config]);
+
+  const activeAdvPhysics: TrimAdvancedPhysicsConfig = useMemo(() => {
+    if (config.advancedPhysics) return config.advancedPhysics;
+    const l0 = config.layers[0];
+    const inf = inferCrystalPresetForLayer(l0?.name || 'Si', l0?.elements[0]?.z || 14);
+    return {
+      ...DEFAULT_ADVANCED_PHYSICS,
+      crystalLattice: inf.lattice,
+      latticeConstantA: inf.aA,
+      latticeCConstantA: inf.cA,
+      debyeTempK: inf.debyeTempK,
+    };
+  }, [config.advancedPhysics, config.layers]);
+
+  const updateAdvPhysics = (patch: Partial<TrimAdvancedPhysicsConfig>) => {
+    if (!onUpdateConfig) return;
+    onUpdateConfig({
+      ...config,
+      advancedPhysics: {
+        ...activeAdvPhysics,
+        ...patch,
+      },
+    });
+  };
 
   // Sync totalIons updates mid-run without resetting completed ions
   useEffect(() => {
@@ -219,19 +263,27 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
         const l0 = config.layers[0];
         const el0 = l0?.elements[0];
         const totalW = config.layers.reduce((a, b) => a + b.widthA, 0) || 1000;
+        const potCode =
+          activeAdvPhysics.screeningPotential === 'krc'
+            ? 1
+            : activeAdvPhysics.screeningPotential === 'moliere'
+            ? 2
+            : 0;
         gpuRunnerRef.current
           .runBatch(dispatchCount, {
             z1: config.ion.z1,
             m1: config.ion.massAmu,
             energyEv: config.ion.energyKeV * 1000.0,
             angleRad: (config.ion.angleDeg * Math.PI) / 180.0,
-            z2: el0?.z || 14,
-            m2: el0?.massAmu || 28.086,
-            atomDensityA3: 0.05,
+            z2: gpuLut.meanZ2 || el0?.z || 14,
+            m2: gpuLut.meanM2 || el0?.massAmu || 28.086,
+            atomDensityA3: gpuLut.atomDensityA3 || 0.05,
             targetWidthA: totalW,
             edEv: el0?.displacementEv || 15,
             esEv: el0?.surfaceBindingEv || 2.1,
             binWidthA: snapshot.binWidthA || 10,
+            seTable: gpuLut.seTable,
+            potentialCode: potCode,
           })
           .then((res) => {
             if (cancelled) return;
@@ -590,6 +642,189 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
             />
           </div>
         </div>
+      </div>
+
+      {/* Crystal-TRIM Orientation, Tilt/Twist & Post-SRIM-2003 Advanced Physics Strip */}
+      <div className="bg-slate-900/80 border border-slate-800 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+        <div className="flex flex-wrap items-center gap-2.5">
+          <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-300">
+            Post-SRIM Physics:
+          </span>
+
+          <button
+            type="button"
+            disabled={!onUpdateConfig}
+            onClick={() =>
+              updateAdvPhysics({ crystalMode: !activeAdvPhysics.crystalMode })
+            }
+            className={`px-2.5 py-1 rounded-lg font-semibold border transition-colors ${
+              activeAdvPhysics.crystalMode
+                ? 'bg-indigo-600 text-white border-indigo-400'
+                : 'bg-slate-950 text-slate-300 border-slate-700 hover:border-slate-500'
+            }`}
+          >
+            {activeAdvPhysics.crystalMode
+              ? 'Crystal Lattice (Channeling ON)'
+              : 'Amorphous (SRIM-2003)'}
+          </button>
+
+          {activeAdvPhysics.crystalMode && (
+            <>
+              <div className="flex items-center gap-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                <span className="text-slate-400">Axis:</span>
+                {(['<100>', '<110>', '<111>', '<112>'] as CrystalOrientation[]).map(
+                  (ori) => (
+                    <button
+                      key={ori}
+                      type="button"
+                      onClick={() => updateAdvPhysics({ crystalOrientation: ori })}
+                      className={`px-1.5 py-0.5 rounded font-mono text-[11px] ${
+                        activeAdvPhysics.crystalOrientation === ori
+                          ? 'bg-cyan-600 text-white font-bold'
+                          : 'text-slate-400 hover:text-white'
+                      }`}
+                    >
+                      {ori}
+                    </button>
+                  )
+                )}
+              </div>
+
+              <label className="flex items-center gap-1.5 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                <span className="text-slate-400">Tilt:</span>
+                <input
+                  type="number"
+                  step={0.5}
+                  min={-25}
+                  max={25}
+                  value={activeAdvPhysics.crystalTiltDeg}
+                  onChange={(e) =>
+                    updateAdvPhysics({
+                      crystalTiltDeg: Math.max(
+                        -25,
+                        Math.min(25, Number(e.target.value) || 0)
+                      ),
+                    })
+                  }
+                  className="w-12 bg-transparent font-mono text-cyan-300 font-bold focus:outline-none"
+                />
+                <span className="text-slate-500">°</span>
+              </label>
+
+              <label className="flex items-center gap-1.5 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                <span className="text-slate-400">Twist:</span>
+                <input
+                  type="number"
+                  step={1}
+                  min={0}
+                  max={360}
+                  value={activeAdvPhysics.crystalTwistDeg}
+                  onChange={(e) =>
+                    updateAdvPhysics({
+                      crystalTwistDeg: Math.max(
+                        0,
+                        Math.min(360, Number(e.target.value) || 0)
+                      ),
+                    })
+                  }
+                  className="w-12 bg-transparent font-mono text-emerald-300 font-bold focus:outline-none"
+                />
+                <span className="text-slate-500">°</span>
+              </label>
+            </>
+          )}
+
+          <select
+            value={activeAdvPhysics.screeningPotential}
+            onChange={(e) =>
+              updateAdvPhysics({
+                screeningPotential: e.target.value as ScreeningPotentialType,
+              })
+            }
+            disabled={!onUpdateConfig}
+            className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] font-mono text-slate-200"
+            title="Interatomic Screening Potential"
+          >
+            <option value="zbl">Potential: ZBL Universal</option>
+            <option value="krc">Potential: Kr-C (Channeling)</option>
+            <option value="moliere">Potential: Moliere</option>
+          </select>
+
+          <button
+            type="button"
+            disabled={!onUpdateConfig}
+            onClick={() =>
+              updateAdvPhysics({
+                localElectronicStopping: !activeAdvPhysics.localElectronicStopping,
+              })
+            }
+            className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+              activeAdvPhysics.localElectronicStopping
+                ? 'bg-cyan-950/70 border-cyan-500/50 text-cyan-200'
+                : 'bg-slate-950 border-slate-800 text-slate-500'
+            }`}
+            title="Oen-Robinson impact-parameter b-dependent Se(b)"
+          >
+            Oen–Robinson Sₑ(b)
+          </button>
+
+          <button
+            type="button"
+            disabled={!onUpdateConfig}
+            onClick={() =>
+              updateAdvPhysics({
+                arcDpaRecombination: !activeAdvPhysics.arcDpaRecombination,
+              })
+            }
+            className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+              activeAdvPhysics.arcDpaRecombination
+                ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-200'
+                : 'bg-slate-950 border-slate-800 text-slate-500'
+            }`}
+            title="Nordlund ARC-dpa athermal Frenkel-pair recombination"
+          >
+            ARC-dpa
+          </button>
+
+          <button
+            type="button"
+            disabled={!onUpdateConfig}
+            onClick={() =>
+              updateAdvPhysics({
+                dynamicComposition: !activeAdvPhysics.dynamicComposition,
+              })
+            }
+            className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+              activeAdvPhysics.dynamicComposition
+                ? 'bg-amber-950/70 border-amber-500/50 text-amber-200'
+                : 'bg-slate-950 border-slate-800 text-slate-500'
+            }`}
+            title="TRIDYN dynamic composition, fluence accumulation & surface sputtering erosion"
+          >
+            TRIDYN Dynamic
+          </button>
+        </div>
+
+        {snapshot.advancedDiagnostics && (
+          <div className="flex flex-wrap items-center gap-3 font-mono text-[11px] text-slate-300">
+            {activeAdvPhysics.crystalMode && (
+              <span>
+                Channeled:{' '}
+                <strong className="text-cyan-300">
+                  {snapshot.advancedDiagnostics.channeledFractionPct.toFixed(1)}%
+                </strong>
+              </span>
+            )}
+            {activeAdvPhysics.dynamicComposition && (
+              <span>
+                Eroded:{' '}
+                <strong className="text-amber-300">
+                  {snapshot.advancedDiagnostics.erodedDepthA.toFixed(2)} Å
+                </strong>
+              </span>
+            )}
+          </div>
+        )}
       </div>
 
       {/* Live Telemetry KPI Strip */}
@@ -1205,6 +1440,21 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
   series,
 }) => {
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState<number>(880);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.floor(entry.contentRect.width);
+        if (w > 240) setWidth(w);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const handleExportSvg = () => {
     const svgStr = generateSvgLinePlot({
@@ -1244,13 +1494,13 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
     return m > 0 ? m * 1.08 : 1.0;
   }, [series]);
 
-  const width = 680;
-  const height = 290;
-  const padL = 64;
-  const padR = 20;
-  const padT = 22;
-  const padB = 38;
-  const plotW = width - padL - padR;
+  // 1.5x height (290 -> 435px) and dynamic full-container width with minimal side margins
+  const height = 435;
+  const padL = 56;
+  const padR = 12;
+  const padT = 18;
+  const padB = 34;
+  const plotW = Math.max(100, width - padL - padR);
   const plotH = height - padT - padB;
   const nBins = Math.max(1, depthsA.length);
 
@@ -1293,10 +1543,13 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
         </div>
       </div>
 
-      <div className="relative bg-slate-950/90 border border-slate-800 rounded-xl p-2">
+      <div
+        ref={boxRef}
+        className="relative bg-slate-950/90 border border-slate-800 rounded-xl p-1"
+      >
         <svg
           viewBox={`0 0 ${width} ${height}`}
-          className="w-full h-[290px] overflow-visible"
+          className="w-full h-[435px] block overflow-visible"
           onMouseLeave={() => setHoverIdx(null)}
         >
           {/* Horizontal Grid Lines */}

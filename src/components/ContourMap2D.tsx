@@ -35,11 +35,27 @@ function getColor(t: number, map: ColorMapType): [number, number, number] {
 }
 
 export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) => {
+  const containerRef = useRef<HTMLDivElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const [canvasWidth, setCanvasWidth] = useState<number>(840);
+  const canvasHeight = 660; // 1.5x of previous 440px height
   const [colormap, setColormap] = useState<ColorMapType>('turbo');
   const [axisMode, setAxisMode] = useState<AxisMode>('xy');
   const [showContours, setShowContours] = useState<boolean>(true);
   const [hoverCoord, setHoverCoord] = useState<{ xA: number; yA: number; val: number } | null>(null);
+
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.floor(entry.contentRect.width);
+        if (w > 240) setCanvasWidth(w);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
 
   const gridSize = 64;
 
@@ -117,11 +133,11 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    // Margin pads
-    const padL = 70;
-    const padR = 30;
-    const padT = 30;
-    const padB = 50;
+    // Compact horizontal pads so the heatmap fills the plot box edge-to-edge
+    const padL = 56;
+    const padR = 14;
+    const padT = 22;
+    const padB = 42;
     const pw = w - padL - padR;
     const ph = h - padT - padB;
 
@@ -222,19 +238,19 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     ctx.textAlign = 'center';
     ctx.fillText(axisMode === 'xy' ? 'Lateral Y Axis (Å)' : 'Radial Distance R (Å)', 0, 0);
     ctx.restore();
-  }, [grid, maxVal, maxDepthA, maxLatA, colormap, axisMode, showContours, config.layers]);
+  }, [grid, maxVal, maxDepthA, maxLatA, colormap, axisMode, showContours, config.layers, canvasWidth]);
 
   const handleMouseMove = (e: React.MouseEvent<HTMLCanvasElement>) => {
     const canvas = canvasRef.current;
     if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
-    const clientX = e.clientX - rect.left;
-    const clientY = e.clientY - rect.top;
+    const clientX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
+    const clientY = ((e.clientY - rect.top) / Math.max(1, rect.height)) * canvas.height;
 
-    const padL = 70;
-    const padR = 30;
-    const padT = 30;
-    const padB = 50;
+    const padL = 56;
+    const padR = 14;
+    const padT = 22;
+    const padB = 42;
     const pw = canvas.width - padL - padR;
     const ph = canvas.height - padT - padB;
 
@@ -335,15 +351,18 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
         </div>
       </div>
 
-      {/* Canvas Viewport */}
-      <div className="relative flex justify-center bg-slate-950/60 rounded-xl p-3 border border-slate-800/80">
+      {/* Canvas Viewport - full width & 1.5x height */}
+      <div
+        ref={containerRef}
+        className="relative bg-slate-950/60 rounded-xl p-1 border border-slate-800/80 w-full"
+      >
         <canvas
           ref={canvasRef}
-          width={760}
-          height={440}
+          width={canvasWidth}
+          height={canvasHeight}
           onMouseMove={handleMouseMove}
           onMouseLeave={() => setHoverCoord(null)}
-          className="rounded-lg shadow-lg cursor-crosshair max-w-full h-auto"
+          className="rounded-lg shadow-lg cursor-crosshair w-full h-[660px] block"
         />
 
         {/* Hover Readout Tooltip */}

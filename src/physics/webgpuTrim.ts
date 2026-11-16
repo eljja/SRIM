@@ -1,3 +1,6 @@
+import { calcLayerStopping } from './stopping';
+import type { TrimSetupConfig } from './types';
+
 export interface WebGpuParams {
   z1: number;
   m1: number;
@@ -10,6 +13,10 @@ export interface WebGpuParams {
   edEv: number;
   esEv: number;
   binWidthA: number;
+  /** Optional 128-point tabulated SCOEF03 Se(E) in eV/A (log-spaced from 5 eV to energyEv) */
+  seTable?: Float32Array;
+  /** Screening potential: 0 = ZBL, 1 = Kr-C, 2 = Moliere */
+  potentialCode?: number;
 }
 
 export interface WebGpuBatchResult {
@@ -30,8 +37,60 @@ export function isWebGpuSupported(): boolean {
 }
 
 /**
- * High-performance WGSL Compute Shader for Monte Carlo Binary Collision Approximation (BCA).
- * Computes individual ion trajectories in parallel using GPU workgroups.
+ * Builds an exact 128-point tabulated SCOEF03 + CAB + Bragg electronic stopping table (eV/A)
+ * log-spaced from 5 eV up to config.ion.energyKeV for GPU interpolation.
+ */
+export function buildGpuStoppingTable(config: TrimSetupConfig, layerIdx: number = 0): {
+  seTable: Float32Array;
+  atomDensityA3: number;
+  meanZ2: number;
+  meanM2: number;
+} {
+  const layer = config.layers[Math.min(layerIdx, config.layers.length - 1)] || config.layers[0];
+  const totalStoich = layer.elements.reduce((a, b) => a + Math.max(0, b.stoich), 0) || 1;
+  let meanZ2 = 0;
+  let meanM2 = 0;
+  const elements = layer.elements.map((e) => {
+    const p = Math.max(0, e.stoich) / totalStoich;
+    meanZ2 += p * e.z;
+    meanM2 += p * e.massAmu;
+    return { z: e.z, mass: e.massAmu, stoich: e.stoich };
+  });
+  meanM2 = meanM2 || 28.086;
+  const atomDensityA3 = Math.max(
+    1e-6,
+    ((layer.densityGPerCm3 * 6.02214076e23) / meanM2) * 1e-24
+  );
+  const eMaxEv = Math.max(100, config.ion.energyKeV * 1000.0);
+  const logMin = Math.log(5.0);
+  const logMax = Math.log(eMaxEv);
+  const seTable = new Float32Array(128);
+  const compoundCorr = layer.compoundCorr * (config.braggCorrection || 1.0);
+
+  for (let i = 0; i < 128; i++) {
+    const eEv = Math.exp(logMin + ((logMax - logMin) * i) / 127);
+    const info = calcLayerStopping(
+      config.ion.z1,
+      config.ion.massAmu,
+      eEv / 1000.0,
+      elements,
+      layer.densityGPerCm3,
+      layer.phase,
+      compoundCorr,
+      1,
+      true,
+      true
+    );
+    seTable[i] = info.seEvPerA;
+  }
+
+  return { seTable, atomDensityA3, meanZ2, meanM2 };
+}
+
+/**
+ * Full-Fidelity WGSL Compute Shader for Monte Carlo Binary Collision Approximation (BCA).
+ * Implements ZBL / Kr-C / Moliere screening with Newton-Raphson closest approach x0,
+ * Biersack-Haggmark Magic Formula scattering, exact 3D direction rotation, and tabulated SCOEF03 Se(E).
  */
 export const WGSL_TRIM_SHADER = `
 struct SimParams {
@@ -48,7 +107,7 @@ struct SimParams {
   binWidthA: f32,
   batchCount: u32,
   seedBase: u32,
-  pad0: u32,
+  potentialCode: u32, // 0=ZBL, 1=Kr-C, 2=Moliere
   pad1: u32,
   pad2: u32,
 };
@@ -63,21 +122,110 @@ struct StoppedIon {
 @group(0) @binding(0) var<uniform> params: SimParams;
 @group(0) @binding(1) var<storage, read_write> histBins: array<atomic<u32>, 100>;
 @group(0) @binding(2) var<storage, read_write> stoppedIons: array<StoppedIon>;
-@group(0) @binding(3) var<storage, read_write> globalCounters: array<atomic<u32>, 4>; // [stopped, backscatter, transmit, totalCompleted]
+@group(0) @binding(3) var<storage, read_write> globalCounters: array<atomic<u32>, 4>;
+@group(0) @binding(4) var<storage, read> seTable: array<f32, 128>;
 
-// PCG 32-bit pseudorandom generator
 fn pcg32(state: ptr<function, u32>) -> f32 {
   let old = *state;
   *state = old * 747796405u + 2891336453u;
   var word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
   word = (word >> 22u) ^ word;
-  return f32(word) / 4294967296.0;
+  return max(1e-7, min(0.9999999, f32(word) / 4294967296.0));
 }
 
-// ZBL Magic Scattering approximation on GPU
-fn calcScatteringTheta(eps: f32, bRed: f32) -> f32 {
-  let alpha = 1.0 + 4.0 * eps * eps * bRed * bRed;
-  return 2.0 * acos(clamp(sqrt(1.0 / alpha), 0.0, 1.0));
+fn evalScreening(x: f32, pot: u32) -> vec2<f32> {
+  if (pot == 1u) {
+    // Wilson-Haggmark-Biersack Kr-C
+    let t0 = 0.190945 * exp(-0.278544 * x);
+    let t1 = 0.473674 * exp(-0.637174 * x);
+    let t2 = 0.335381 * exp(-1.919249 * x);
+    return vec2<f32>(t0 + t1 + t2, -(0.278544 * t0 + 0.637174 * t1 + 1.919249 * t2));
+  }
+  if (pot == 2u) {
+    // Moliere
+    let t0 = 0.35 * exp(-0.3 * x);
+    let t1 = 0.55 * exp(-1.2 * x);
+    let t2 = 0.10 * exp(-6.0 * x);
+    return vec2<f32>(t0 + t1 + t2, -(0.3 * t0 + 1.2 * t1 + 6.0 * t2));
+  }
+  // ZBL Universal
+  let t0 = 0.18175 * exp(-3.1998 * x);
+  let t1 = 0.50986 * exp(-0.94229 * x);
+  let t2 = 0.28022 * exp(-0.4029 * x);
+  let t3 = 0.02817 * exp(-0.20162 * x);
+  let phi = t0 + t1 + t2 + t3;
+  let dphi = -(3.1998 * t0 + 0.94229 * t1 + 0.4029 * t2 + 0.20162 * t3);
+  return vec2<f32>(phi, dphi);
+}
+
+// Lookup tabulated SCOEF03 Se(E) in eV/A
+fn lookupSeEvPerA(energyEv: f32) -> f32 {
+  let eMax = max(100.0, params.energyEv);
+  let eClamped = max(5.0, min(eMax, energyEv));
+  let t = log(eClamped / 5.0) / max(1e-4, log(eMax / 5.0));
+  let fIdx = clamp(t * 127.0, 0.0, 126.999);
+  let i0 = u32(fIdx);
+  let i1 = min(127u, i0 + 1u);
+  let frac = fIdx - f32(i0);
+  return seTable[i0] * (1.0 - frac) + seTable[i1] * frac;
+}
+
+// ZBL / Kr-C / Moliere Biersack-Haggmark Magic Formula scattering
+fn magicScatteringSinHalfTheta(eps: f32, bRed: f32, pot: u32) -> f32 {
+  if (bRed <= 1e-6) {
+    return 1.0;
+  }
+  if (eps > 10.0 && eps * bRed > 10.0) {
+    let cotH = 2.0 * eps * bRed;
+    return 1.0 / sqrt(1.0 + cotH * cotH);
+  }
+  let rMinCoul = (1.0 + sqrt(1.0 + 4.0 * eps * eps * bRed * bRed)) / (2.0 * eps);
+  var x0 = max(bRed + 1e-5, min(rMinCoul, bRed + 1.2 / pow(max(1e-7, eps), 0.35)));
+  for (var iter = 0u; iter < 12u; iter = iter + 1u) {
+    let sd = evalScreening(x0, pot);
+    let invX = 1.0 / x0;
+    let br = bRed * invX;
+    let f = 1.0 - (sd.x * invX) / eps - br * br;
+    let df = -(sd.y * invX - sd.x * invX * invX) / eps + 2.0 * br * br * invX;
+    if (abs(df) < 1e-12) { break; }
+    var nx = x0 - f / df;
+    if (nx <= bRed) { nx = 0.5 * (bRed + x0); }
+    if (abs(nx - x0) < 1e-5 * x0) {
+      x0 = nx;
+      break;
+    }
+    x0 = nx;
+  }
+  let sd = evalScreening(x0, pot);
+  let denomRc = sd.y / x0 - sd.x / (x0 * x0);
+  let numerRc = -2.0 * eps * (1.0 - sd.x / (eps * x0));
+  let rC = select(0.0, max(0.0, numerRc / denomRc), abs(denomRc) > 1e-12);
+  let sqrtEps = sqrt(max(1e-9, eps));
+  let alpha = 1.0 + 0.99229 / sqrtEps;
+  let beta = (0.011615 + sqrtEps) / (0.0071222 + sqrtEps);
+  let gammaM = (14.813 + eps) / (9.3066 + eps);
+  let aTerm = 2.0 * alpha * eps * pow(bRed, beta);
+  let gTerm = gammaM / max(1e-9, sqrt(1.0 + aTerm * aTerm) - aTerm);
+  let delta = (aTerm * (x0 - bRed)) / (1.0 + gTerm);
+  let cosHalf = clamp((bRed + rC + delta) / max(1e-9, x0 + rC), 0.0, 1.0);
+  return sqrt(max(0.0, 1.0 - cosHalf * cosHalf));
+}
+
+// Exact 3D rotation of unit vector (cx, cy, cz) by polar Psi and azimuthal Phi
+fn rotateDir3D(d: vec3<f32>, cosPsi: f32, sinPsi: f32, phi: f32) -> vec3<f32> {
+  let cosPhi = cos(phi);
+  let sinPhi = sin(phi);
+  let sinTheta0 = sqrt(max(0.0, 1.0 - d.x * d.x));
+  var out = vec3<f32>(0.0);
+  if (sinTheta0 < 1e-5) {
+    let sgn = select(-1.0, 1.0, d.x >= 0.0);
+    out = vec3<f32>(sgn * cosPsi, sinPsi * cosPhi, sinPsi * sinPhi);
+  } else {
+    out.x = d.x * cosPsi - sinPsi * sinTheta0 * cosPhi;
+    out.y = d.y * cosPsi + (sinPsi * (d.x * d.y * cosPhi - d.z * sinPhi)) / sinTheta0;
+    out.z = d.z * cosPsi + (sinPsi * (d.x * d.z * cosPhi + d.y * sinPhi)) / sinTheta0;
+  }
+  return normalize(out);
 }
 
 @compute @workgroup_size(64)
@@ -96,88 +244,92 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   let N = params.atomDensityA3;
   let widthA = params.targetWidthA;
   let eStop = max(5.0, params.esEv);
+  let pot = params.potentialCode;
 
   var energy = params.energyEv;
-  var x = 0.0;
-  var y = 0.0;
-  var z = 0.0;
-  var cosX = cos(params.angleRad);
-  var cosY = sin(params.angleRad);
-  var cosZ = 0.0;
+  var pos = vec3<f32>(0.0, 0.0, 0.0);
+  var dir = vec3<f32>(cos(params.angleRad), sin(params.angleRad), 0.0);
 
-  let aU = 0.46853 / (pow(z1, 0.23) + pow(z2, 0.23));
+  let aU = select(
+    0.46848 / pow(sqrt(z1) + sqrt(z2), 2.0 / 3.0),
+    0.46853 / (pow(z1, 0.23) + pow(z2, 0.23)),
+    pot == 0u
+  );
   let gamma = (4.0 * m1 * m2) / ((m1 + m2) * (m1 + m2));
   let monoL = pow(N, -1.0 / 3.0);
-  let pMax = 1.0 / sqrt(3.14159265 * N * monoL);
+  let pMaxMono = 1.0 / sqrt(3.14159265 * N * monoL);
+  let massRatio = m1 / m2;
 
   var steps = 0u;
-  var fate = 0u; // 0 = stopped, 1 = backscatter, 2 = transmit
+  var fate = 0u;
 
-  while (steps < 4000u && energy > eStop) {
+  while (steps < 12000u && energy > eStop) {
     steps = steps + 1u;
 
-    // Approximate electronic stopping loss Se
-    let deElec = 0.8 * sqrt(max(1.0, energy)) * 0.05 * monoL;
+    let eCm = (energy * m2) / (m1 + m2);
+    let eps = max(1e-7, (eCm * aU) / (14.39979 * z1 * z2));
+    var jumpA = monoL;
+    if (energy > 200.0) {
+      let bMaxRed = sqrt(max(0.25, (gamma * energy) / (5.0 * max(1.0, 4.0 * eps * eps))));
+      let pMaxE = max(pMaxMono, min(aU * (bMaxRed + 1.5), pMaxMono * 3.0));
+      let mfp = 1.0 / (3.14159265 * N * pMaxE * pMaxE);
+      let maxPhys = min(40.0, max(10.0, 0.05 * sqrt(energy)));
+      jumpA = max(monoL, min(mfp, maxPhys));
+    }
+
+    let nextPos = pos + jumpA * dir;
+
+    if (nextPos.x < 0.0) {
+      fate = 1u;
+      pos.x = 0.0;
+      break;
+    }
+    if (nextPos.x > widthA) {
+      fate = 2u;
+      pos.x = widthA;
+      break;
+    }
+
+    let se = lookupSeEvPerA(energy);
+    let deElec = min(energy - 0.5 * eStop, max(0.0, se * jumpA));
     energy = max(0.0, energy - deElec);
+    pos = nextPos;
     if (energy <= eStop) {
       break;
     }
 
-    let nextX = x + monoL * cosX;
-    let nextY = y + monoL * cosY;
-    let nextZ = z + monoL * cosZ;
-
-    // Check boundaries
-    if (nextX < 0.0) {
-      fate = 1u;
-      x = 0.0;
-      break;
-    }
-    if (nextX > widthA) {
-      fate = 2u;
-      x = widthA;
-      break;
-    }
-
-    x = nextX;
-    y = nextY;
-    z = nextZ;
-
-    // Elastic collision
-    let randP = pcg32(&rngState);
-    let b = pMax * sqrt(randP);
-    let eCm = (energy * m2) / (m1 + m2);
-    let eps = (eCm * aU) / (14.4 * z1 * z2);
+    let pMaxStep = 1.0 / sqrt(3.14159265 * N * jumpA);
+    let b = pMaxStep * sqrt(pcg32(&rngState));
     let bRed = b / aU;
 
-    let theta = calcScatteringTheta(eps, bRed);
-    let sinT = sin(theta);
-    let cosT = cos(theta);
-    let recoilE = gamma * energy * sinT * sinT * 0.5;
+    let sinHalf = magicScatteringSinHalfTheta(eps, bRed, pot);
+    let sinSqHalf = sinHalf * sinHalf;
+    let cosHalf = sqrt(max(0.0, 1.0 - sinSqHalf));
+    let recoilE = min(energy, gamma * energy * sinSqHalf);
     energy = max(0.0, energy - recoilE);
 
-    // Azimuthal deflection
+    let sinTheta = 2.0 * sinHalf * cosHalf;
+    let cosTheta = 1.0 - 2.0 * sinSqHalf;
+    let denomIon = sqrt(max(1e-12, sinTheta * sinTheta + (cosTheta + massRatio) * (cosTheta + massRatio)));
+    let cosPsiIon = clamp((cosTheta + massRatio) / denomIon, -1.0, 1.0);
+    let sinPsiIon = clamp(sinTheta / denomIon, 0.0, 1.0);
+
     let phi = 6.2831853 * pcg32(&rngState);
-    cosX = clamp(cosX * cosT - sin(acos(clamp(cosX, -1.0, 1.0))) * sinT * cos(phi), -1.0, 1.0);
-    cosY = sin(acos(cosX)) * cos(phi);
-    cosZ = sin(acos(cosX)) * sin(phi);
+    dir = rotateDir3D(dir, cosPsiIon, sinPsiIon, phi);
   }
 
-  // Update global counters
   atomicAdd(&globalCounters[fate], 1u);
   atomicAdd(&globalCounters[3], 1u);
 
-  // If stopped inside target, record into depth histogram
   if (fate == 0u) {
-    let binIdx = u32(clamp(x / params.binWidthA, 0.0, 99.0));
+    let binIdx = u32(clamp(pos.x / params.binWidthA, 0.0, 99.0));
     atomicAdd(&histBins[binIdx], 1u);
   }
 
-  // Record stopped ion coordinates (up to 4096 ions per batch)
   if (ionIdx < 4096u) {
-    stoppedIons[ionIdx].x = x;
-    stoppedIons[ionIdx].y = y;
-    stoppedIons[ionIdx].z = z;
+    stoppedIons[ionIdx].x = pos.x;
+    stoppedIons[ionIdx].y = pos.y;
+    stoppedIons[ionIdx].z = pos.z;
     stoppedIons[ionIdx].fate = fate;
   }
 }
@@ -249,10 +401,10 @@ export class WebGpuTrimRunner {
     uniformArray[8] = params.edEv;
     uniformArray[9] = params.esEv;
     uniformArray[10] = params.binWidthA;
-    // Uint32 views for integer params
     const u32View = new Uint32Array(uniformArray.buffer);
     u32View[11] = nIons;
     u32View[12] = (Date.now() & 0xffffffff) >>> 0;
+    u32View[13] = params.potentialCode ?? 0;
 
     const uniformBuffer = this.device.createBuffer({
       size: uniformArray.byteLength,
@@ -280,6 +432,17 @@ export class WebGpuTrimRunner {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
+    // 5. SCOEF03 Tabulated Stopping buffer: 128 * 4 = 512 bytes
+    const seArr =
+      params.seTable && params.seTable.length === 128
+        ? params.seTable
+        : new Float32Array(128).fill(Math.max(1.0, 0.04 * Math.sqrt(params.energyEv)));
+    const seBuffer = this.device.createBuffer({
+      size: 128 * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    this.device.queue.writeBuffer(seBuffer, 0, seArr);
+
     // Staging buffers for readback
     const stageHist = this.device.createBuffer({
       size: 400,
@@ -301,6 +464,7 @@ export class WebGpuTrimRunner {
         { binding: 1, resource: { buffer: histBuffer } },
         { binding: 2, resource: { buffer: stoppedBuffer } },
         { binding: 3, resource: { buffer: countersBuffer } },
+        { binding: 4, resource: { buffer: seBuffer } },
       ],
     });
 
@@ -317,7 +481,6 @@ export class WebGpuTrimRunner {
 
     this.device.queue.submit([commandEncoder.finish()]);
 
-    // Read back results asynchronously
     await Promise.all([
       stageHist.mapAsync(GPUMapMode.READ),
       stageStopped.mapAsync(GPUMapMode.READ),
@@ -339,12 +502,9 @@ export class WebGpuTrimRunner {
 
     for (let i = 0; i < maxIonsToRecord; i++) {
       const offset = i * 4;
-      const x = stoppedFloats[offset];
-      const y = stoppedFloats[offset + 1];
-      const z = stoppedFloats[offset + 2];
-      stoppedX.push(x);
-      stoppedY.push(y);
-      stoppedZ.push(z);
+      stoppedX.push(stoppedFloats[offset]);
+      stoppedY.push(stoppedFloats[offset + 1]);
+      stoppedZ.push(stoppedFloats[offset + 2]);
     }
 
     stageHist.unmap();
@@ -355,6 +515,7 @@ export class WebGpuTrimRunner {
     histBuffer.destroy();
     stoppedBuffer.destroy();
     countersBuffer.destroy();
+    seBuffer.destroy();
     stageHist.destroy();
     stageStopped.destroy();
     stageCounters.destroy();

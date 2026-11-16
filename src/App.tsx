@@ -132,6 +132,7 @@ export function App() {
         {activeModule === 'cockpit' && (
           <TrimCockpit
             config={trimConfig}
+            onUpdateConfig={setTrimConfig}
             onUpdateTotalIons={(nextTotal) =>
               setTrimConfig((prev) => ({ ...prev, totalIons: nextTotal }))
             }

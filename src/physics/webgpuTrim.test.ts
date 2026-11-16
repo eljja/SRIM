@@ -7,11 +7,12 @@ describe('WebGPU Acceleration Engine', () => {
     expect(typeof supported).toBe('boolean');
   });
 
-  it('contains valid WGSL shader code with workgroup compute entrypoint', () => {
+  it('contains valid WGSL shader code with workgroup compute entrypoint and full Magic Formula + SCOEF03 LUT', () => {
     expect(WGSL_TRIM_SHADER).toContain('@compute');
     expect(WGSL_TRIM_SHADER).toContain('@workgroup_size(');
     expect(WGSL_TRIM_SHADER).toContain('pcg32');
-    expect(WGSL_TRIM_SHADER).toContain('ZBL Magic Scattering');
+    expect(WGSL_TRIM_SHADER).toContain('magicScatteringSinHalfTheta');
+    expect(WGSL_TRIM_SHADER).toContain('lookupSeEvPerA');
   });
 
   it('instantiates WebGpuTrimRunner and handles unsupported environments gracefully', async () => {

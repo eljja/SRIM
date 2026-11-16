@@ -1,7 +1,23 @@
 import { getElementByZ } from '../data';
 import { calcElectronicStoppingElement, calcLayerStopping } from './stopping';
+import {
+  buildCrystalRotationMatrix,
+  buildCrystalUnitCell,
+  calcArcDpaVacancies,
+  calcDebyeVibrationSigmaA,
+  calcOenRobinsonStoppingEv,
+  calcScreeningLengthA,
+  evalScreeningPotential,
+  findCrystalCollisionsAlongRay,
+  rotateCrystalToLab,
+  rotateLabToCrystal,
+  type CrystalUnitCellSpec,
+  type Mat3,
+} from './advancedPhysics';
 import type {
+  ScreeningPotentialType,
   TransmittedIonRecord,
+  TrimAdvancedPhysicsConfig,
   TrimCollisionEvent,
   TrimElementConfig,
   TrimLayerConfig,
@@ -78,7 +94,7 @@ export interface MagicScatteringResult {
 }
 
 /**
- * Computes binary elastic collision scattering using the ZBL Universal Screening Potential
+ * Computes binary elastic collision scattering using ZBL, Kr-C, or Moliere screening potential
  * and Biersack-Haggmark Magic Formula (TRIM.exe 0x05200..0x07400).
  */
 export function calcMagicScattering(
@@ -87,9 +103,10 @@ export function calcMagicScattering(
   z2: number,
   m2: number,
   energyEv: number,
-  impactParamA: number
+  impactParamA: number,
+  potential: ScreeningPotentialType = 'zbl'
 ): MagicScatteringResult {
-  const aU = 0.46853 / (Math.pow(z1, 0.23) + Math.pow(z2, 0.23));
+  const aU = calcScreeningLengthA(z1, z2, potential);
   const eCmEv = (energyEv * m2) / (m1 + m2);
   const coulombEvA = 14.39979 * z1 * z2;
   const eps = Math.max(1e-9, (eCmEv * aU) / coulombEvA);
@@ -101,7 +118,7 @@ export function calcMagicScattering(
     // Solve Phi(x0)/x0 = eps for x0
     let x0 = eps > 1 ? 1.0 / eps : Math.pow(1.0 / eps, 0.35);
     for (let iter = 0; iter < 12; iter++) {
-      const { phi, dPhi } = evalZblScreening(x0);
+      const { phi, dPhi } = evalScreeningPotential(x0, potential);
       const f = phi - eps * x0;
       const df = dPhi - eps;
       const dx = f / (df !== 0 ? df : -1);
@@ -143,7 +160,7 @@ export function calcMagicScattering(
     x0 = Math.max(bRed + 1e-5, Math.min(rMinCoul, bRed + 1.2 / Math.pow(eps, 0.35)));
 
     for (let iter = 0; iter < 15; iter++) {
-      const { phi, dPhi } = evalZblScreening(x0);
+      const { phi, dPhi } = evalScreeningPotential(x0, potential);
       const invX = 1.0 / x0;
       const bRatio = bRed * invX;
       const f = 1.0 - (phi * invX) / eps - bRatio * bRatio;
@@ -161,7 +178,7 @@ export function calcMagicScattering(
       x0 = nextX;
     }
 
-    const { phi, dPhi } = evalZblScreening(x0);
+    const { phi, dPhi } = evalScreeningPotential(x0, potential);
     const denomRc = dPhi / x0 - phi / (x0 * x0);
     const numerRc = -2.0 * eps * (1.0 - phi / (eps * x0));
     const rC = Math.abs(denomRc) > 1e-14 ? Math.max(0, numerRc / denomRc) : 0.0;
@@ -359,7 +376,8 @@ export function calcQuickKinchinPeaseDamage(
   m2: number,
   recoilEnergyEv: number,
   edEv: number,
-  ebEv: number
+  ebEv: number,
+  useArcDpa: boolean = false
 ): {
   vacancies: number;
   damageEnergyEv: number;
@@ -402,14 +420,15 @@ export function calcQuickKinchinPeaseDamage(
   const damageEnergyEv = eRecoilInit / (1.0 + kL * gEps);
   const recoilIonizationEv = Math.max(0, eRecoilInit - damageEnergyEv);
 
-  // Modified Kinchin-Pease number of Frenkel pairs:
-  // nu = 1 for Ed <= E_D < 2.5*Ed, or 0.8 * E_D / (2 * Ed) = 0.4 * E_D / Ed for E_D >= 2.5*Ed
+  // Modified Kinchin-Pease or Nordlund ARC-dpa surviving Frenkel pairs:
   let vacancies = 1.0;
-  if (damageEnergyEv >= 2.5 * edEv) {
+  if (useArcDpa) {
+    vacancies = calcArcDpaVacancies(damageEnergyEv, edEv, z2);
+  } else if (damageEnergyEv >= 2.5 * edEv) {
     vacancies = (0.4 * damageEnergyEv) / Math.max(1.0, edEv);
   }
 
-  const recoilBindingEv = vacancies * ebEv;
+  const recoilBindingEv = Math.min(damageEnergyEv, vacancies * ebEv);
   const recoilPhononEv = Math.max(0, recoilEnergyEv - recoilIonizationEv - recoilBindingEv);
 
   return {
@@ -520,6 +539,16 @@ export class TrimSimulator {
   // O(1)-memory surface arrival counts [elemIndex][esGridIdx] for sputtering yield vs Es curve
   private surfaceArrivalCounts: number[][] = [];
   private collisions: TrimCollisionEvent[] = [];
+
+  // Post-SRIM-2003 Advanced Physics state
+  private crystalRotMat: Mat3 | null = null;
+  private crystalCell: CrystalUnitCellSpec | null = null;
+  private crystalSigmaVibA = 0.0;
+  private amorphousDpaByBin = new Float64Array(100);
+  private slabDensityScale = new Float64Array(100).fill(1.0);
+  private slabImplantedAtoms = new Float64Array(100);
+  private erodedDepthA = 0.0;
+  private channeledIonCount = 0;
 
   constructor(config: TrimSetupConfig) {
     this.config = {
@@ -639,6 +668,38 @@ export class TrimSimulator {
     );
     this.sputteredCountByElem = new Array<number>(this.uniqueElements.length).fill(0);
     this.sputteredEnergySumByElem = new Array<number>(this.uniqueElements.length).fill(0);
+
+    // Initialize Crystal-TRIM rotation & unit cell + TRIDYN slab state if configured
+    const adv = this.config.advancedPhysics;
+    this.amorphousDpaByBin.fill(0);
+    this.slabDensityScale.fill(1.0);
+    this.slabImplantedAtoms.fill(0);
+    this.erodedDepthA = 0.0;
+    this.channeledIonCount = 0;
+
+    if (adv?.crystalMode && this.preparedLayers.length > 0) {
+      const l0 = this.preparedLayers[0];
+      this.crystalRotMat = buildCrystalRotationMatrix(
+        adv.crystalOrientation,
+        adv.customMiller,
+        adv.crystalTiltDeg || 0,
+        adv.crystalTwistDeg || 0
+      );
+      this.crystalCell = buildCrystalUnitCell(
+        adv.crystalLattice,
+        adv.latticeConstantA || 5.431,
+        adv.latticeCConstantA
+      );
+      this.crystalSigmaVibA = calcDebyeVibrationSigmaA(
+        l0.meanM2,
+        adv.debyeTempK || 645,
+        adv.targetTempK || 300
+      );
+    } else {
+      this.crystalRotMat = null;
+      this.crystalCell = null;
+      this.crystalSigmaVibA = 0.0;
+    }
   }
 
   private getLayerAtDepth(xA: number): PreparedLayer {
@@ -736,9 +797,47 @@ export class TrimSimulator {
       this.config.calculationMode === 3 ||
       this.config.calculationMode === 4;
     const isMonolayerMode = this.config.calculationMode === 3;
+    const adv = this.config.advancedPhysics;
+    const potential: ScreeningPotentialType = adv?.screeningPotential ?? 'zbl';
+    const useArcDpa = Boolean(adv?.arcDpaRecombination);
+    const crystalActive = Boolean(
+      adv?.crystalMode && this.crystalCell && this.crystalRotMat
+    );
+    const crystalCell = this.crystalCell;
+    const crystalRot = this.crystalRotMat;
+    const cyIonOffset = crystalCell ? this.rng() * crystalCell.ay : 0.0;
+    const czIonOffset = crystalCell ? this.rng() * crystalCell.az : 0.0;
+
+    // Dose weight per simulated ion (ions/cm^2 per history) for Dynamic Damage & TRIDYN
+    const simIonTotal = Math.max(1, this.config.totalIons);
+    const fluencePerSimIon = Math.max(0, adv?.doseCm2 ?? 1e13) / simIonTotal;
+
+    // 2D Mask / Gate Edge Shadowing (Y window [-W/2, W/2] in [-0.75W, 0.75W] illuminated band)
+    if (adv?.mask2dEnabled && (adv.maskOpeningA ?? 0) > 0 && this.config.calculationMode !== 4) {
+      const halfOpen = 0.5 * adv.maskOpeningA;
+      yA = (this.rng() * 2.0 - 1.0) * (1.5 * halfOpen);
+      if (recordTrack && points.length > 0) {
+        points[0].yA = yA;
+      }
+      if (Math.abs(yA) > halfOpen) {
+        // Ion strikes opaque gate/hardmask overhang of thickness maskThicknessA (~W/SiO2 stopper)
+        const maskStopEv = Math.max(0, (adv.maskThicknessA || 300) * 45.0);
+        if (energyEv <= maskStopEv) {
+          this.totalPhononIonEv += energyEv;
+          energyEv = 0;
+          if (recordTrack) points.push({ xA: 0, yA, zA, energyEv: 0 });
+          this.stoppedCount += 1;
+          return;
+        }
+        energyEv -= maskStopEv;
+        this.totalIonizIonEv += maskStopEv;
+      }
+    }
 
     let steps = 0;
-    const maxSteps = 20000;
+    const maxSteps = crystalActive ? 40000 : 20000;
+    let totalStepsTaken = 0;
+    let channeledSteps = 0;
     let fate: 'stopped' | 'backscattered' | 'transmitted' = 'stopped';
 
     while (steps < maxSteps) {
@@ -757,9 +856,16 @@ export class TrimSimulator {
         break;
       }
 
+      const curBinPre = this.depthToBin(xA);
+      const rhoScale =
+        adv?.dynamicComposition && curBinPre >= 0
+          ? Math.max(0.1, this.slabDensityScale[curBinPre])
+          : 1.0;
+      const localAtomDensityA3 = pl.atomDensityPerA3 * rhoScale;
+      const localDensityGcm3 = pl.layer.densityGPerCm3 * rhoScale;
+
       // Compute free-flight jump length L and max impact parameter P_max
-      const aU =
-        0.46853 / (Math.pow(z1, 0.23) + Math.pow(pl.meanZ2, 0.23));
+      const aU = calcScreeningLengthA(z1, pl.meanZ2, potential);
       const eCmEv = (energyEv * pl.meanM2) / (m1 + pl.meanM2);
       const eps = Math.max(
         1e-7,
@@ -768,9 +874,8 @@ export class TrimSimulator {
       const gammaMean =
         (4.0 * m1 * pl.meanM2) / Math.pow(m1 + pl.meanM2, 2);
 
-      let jumpLengthA = pl.monolayerJumpA;
+      let jumpLengthA = pl.monolayerJumpA / Math.cbrt(rhoScale);
       if (!isMonolayerMode && energyEv > 200.0) {
-        // Energy-dependent free-flight path so each collision transfers >= T_min (~5 eV)
         const tMinEv = 5.0;
         const bMaxRed = Math.sqrt(
           Math.max(
@@ -784,7 +889,7 @@ export class TrimSimulator {
           Math.min(aU * (bMaxRed + 1.5), pl.pMaxMonoA * 3.0)
         );
         const meanFreePathA =
-          1.0 / (Math.PI * pl.atomDensityPerA3 * pMaxEnergyA * pMaxEnergyA);
+          1.0 / (Math.PI * localAtomDensityA3 * pMaxEnergyA * pMaxEnergyA);
         const maxJumpPhysicalA = Math.min(
           40.0,
           Math.max(10.0, 0.05 * Math.sqrt(energyEv))
@@ -794,6 +899,59 @@ export class TrimSimulator {
           Math.min(meanFreePathA, maxJumpPhysicalA)
         );
       }
+
+      // Decide crystal lattice step vs amorphous BCA step (modulated by dynamic amorphization DPA)
+      const dpaHere = curBinPre >= 0 ? this.amorphousDpaByBin[curBinPre] : 0.0;
+      const critDpa = Math.max(1e-4, adv?.criticalDpa || 0.1);
+      const pAmorphHere =
+        crystalActive && adv?.dynamicDamage
+          ? 1.0 - Math.exp(-dpaHere / critDpa)
+          : 0.0;
+      const useCrystalStep =
+        crystalActive &&
+        crystalCell !== null &&
+        crystalRot !== null &&
+        this.rng() >= pAmorphHere;
+
+      let crystalHits: ReturnType<typeof findCrystalCollisionsAlongRay> = [];
+      let crystalImpactRefA = 0.0;
+      if (useCrystalStep && crystalCell && crystalRot) {
+        const [cx0, cy0, cz0] = rotateLabToCrystal(crystalRot, xA, yA, zA);
+        const [dxC, dyC, dzC] = rotateLabToCrystal(
+          crystalRot,
+          cosX,
+          cosY,
+          cosZ
+        );
+        const maxSearchA = Math.min(jumpLengthA, crystalCell.ax * 0.85, 8.0);
+        const maxImpactCrystalA = Math.min(2.2, Math.max(1.3, pl.pMaxMonoA * 1.25));
+        crystalHits = findCrystalCollisionsAlongRay(
+          crystalCell,
+          cx0,
+          cy0 + cyIonOffset,
+          cz0 + czIonOffset,
+          dxC,
+          dyC,
+          dzC,
+          0.15,
+          maxSearchA,
+          maxImpactCrystalA,
+          this.crystalSigmaVibA,
+          () => this.nextGaussian(),
+          adv?.simultaneousCollisions ? 4 : 1
+        );
+        if (crystalHits.length > 0) {
+          jumpLengthA = Math.max(0.15, crystalHits[0].pathStepA);
+          crystalImpactRefA = crystalHits[0].impactParamA;
+          if (crystalImpactRefA > 0.7) channeledSteps += 1;
+        } else {
+          // Open axial/planar channel glide!
+          jumpLengthA = maxSearchA;
+          crystalImpactRefA = maxImpactCrystalA;
+          channeledSteps += 1;
+        }
+      }
+      totalStepsTaken += 1;
 
       // Advance along current direction
       const nextXA = xA + jumpLengthA * cosX;
@@ -809,7 +967,7 @@ export class TrimSimulator {
           m1,
           energyEv / 1000.0,
           pl.stoppingElements,
-          pl.layer.densityGPerCm3,
+          localDensityGcm3,
           pl.layer.phase,
           pl.effectiveCompoundCorr,
           1,
@@ -841,7 +999,7 @@ export class TrimSimulator {
           m1,
           energyEv / 1000.0,
           pl.stoppingElements,
-          pl.layer.densityGPerCm3,
+          localDensityGcm3,
           pl.layer.phase,
           pl.effectiveCompoundCorr,
           1,
@@ -862,28 +1020,44 @@ export class TrimSimulator {
         break;
       }
 
-      // Electronic energy loss over jumpLengthA (with scaled low-velocity Bohr straggling)
+      // Compute impact parameter P early if amorphous, so Oen-Robinson Se(b) can use it consistently
+      const pMaxStepA = 1.0 / Math.sqrt(Math.PI * localAtomDensityA3 * jumpLengthA);
+      const amorphousImpactParamA = pMaxStepA * Math.sqrt(this.rng());
+      const effectiveImpactForSeA = useCrystalStep
+        ? crystalImpactRefA
+        : amorphousImpactParamA;
+
+      // Electronic energy loss over jumpLengthA (SCOEF03 + optional Oen-Robinson b-dependence + Bohr straggling)
       const midXA = 0.5 * (xA + nextXA);
       const stopInfo = calcLayerStopping(
         z1,
         m1,
         energyEv / 1000.0,
         pl.stoppingElements,
-        pl.layer.densityGPerCm3,
+        localDensityGcm3,
         pl.layer.phase,
         pl.effectiveCompoundCorr,
         1,
         true,
         true
       );
+      const baseSeStepEv = adv?.localElectronicStopping
+        ? calcOenRobinsonStoppingEv(
+            stopInfo.seEvPerA,
+            jumpLengthA,
+            effectiveImpactForSeA,
+            aU,
+            Math.max(pMaxStepA, pl.pMaxMonoA * 1.25)
+          )
+        : stopInfo.seEvPerA * jumpLengthA;
       const meanDeIonizEv = Math.min(
         energyEv - eStopEv * 0.5,
-        Math.max(0, stopInfo.seEvPerA * jumpLengthA)
+        Math.max(0, baseSeStepEv)
       );
       // Lindhard-Scharff & Bonderup velocity reduction factor fStrag for low-velocity Bohr straggling
       const ePerAmu = energyEv / (1000.0 * m1);
       const fStrag = Math.min(1.0, ePerAmu / 25.0);
-      const bohrVar = 260.0 * z1 * z1 * pl.meanZ2 * pl.atomDensityPerA3 * jumpLengthA * fStrag;
+      const bohrVar = 260.0 * z1 * z1 * pl.meanZ2 * localAtomDensityA3 * jumpLengthA * fStrag;
       const maxStrag = 0.3 * meanDeIonizEv;
       const rawStrag = Math.sqrt(Math.max(0, bohrVar)) * this.nextGaussian();
       const stragEv = Math.min(maxStrag, Math.max(-maxStrag, rawStrag));
@@ -914,60 +1088,127 @@ export class TrimSimulator {
         break;
       }
 
-      // Select collision partner & impact parameter P = sqrt(-ln(R1) / (pi * N * L))
-      const targetEl = this.selectTargetElement(pl);
+      // Handle open-channel crystal glide (zero nuclear collision inside cutoff)
+      if (useCrystalStep && crystalHits.length === 0) {
+        if (recordTrack && (steps % 4 === 0 || energyEv <= eStopEv)) {
+          points.push({ xA, yA, zA, energyEv });
+        }
+        continue;
+      }
+
+      // Select collision partner(s) & compute scattering (crystal simultaneous or amorphous single BCA)
+      let targetEl = this.selectTargetElement(pl);
+      let recoilEnergyEv = 0;
+      let recCosX = cosX;
+      let recCosY = cosY;
+      let recCosZ = cosZ;
+
+      if (useCrystalStep && crystalHits.length > 0 && crystalRot) {
+        // Primary strongest / closest hit provides PKA direction; simultaneous neighbors add vector deflection
+        let sumDvX = 0.0;
+        let sumDvY = 0.0;
+        let sumDvZ = 0.0;
+        let primaryT = 0.0;
+
+        for (let hIdx = 0; hIdx < crystalHits.length; hIdx++) {
+          const hit = crystalHits[hIdx];
+          const elAtSub =
+            pl.layer.elements[hit.sublattice % pl.layer.elements.length] ||
+            targetEl;
+          const sHit = calcMagicScattering(
+            z1,
+            m1,
+            elAtSub.z,
+            elAtSub.massAmu,
+            energyEv,
+            hit.impactParamA,
+            potential
+          );
+          const tHit = Math.min(energyEv, sHit.recoilEnergyEv);
+          energyEv -= tHit;
+
+          const [nxL, nyL, nzL] = rotateCrystalToLab(
+            crystalRot,
+            hit.normalCrystX,
+            hit.normalCrystY,
+            hit.normalCrystZ
+          );
+          // Deflect projectile away from atom along -nL cleanly in collision plane
+          sumDvX += (sHit.cosPsiIon - 1.0) * cosX - sHit.sinPsiIon * nxL;
+          sumDvY += (sHit.cosPsiIon - 1.0) * cosY - sHit.sinPsiIon * nyL;
+          sumDvZ += (sHit.cosPsiIon - 1.0) * cosZ - sHit.sinPsiIon * nzL;
+
+          if (hIdx === 0) {
+            targetEl = elAtSub;
+            primaryT = tHit;
+            // Recoil kicks along atom direction (+nL)
+            const rNorm =
+              Math.sqrt(
+                Math.pow(sHit.cosPsiRecoil * cosX + sHit.sinPsiRecoil * nxL, 2) +
+                  Math.pow(sHit.cosPsiRecoil * cosY + sHit.sinPsiRecoil * nyL, 2) +
+                  Math.pow(sHit.cosPsiRecoil * cosZ + sHit.sinPsiRecoil * nzL, 2)
+              ) || 1.0;
+            recCosX = (sHit.cosPsiRecoil * cosX + sHit.sinPsiRecoil * nxL) / rNorm;
+            recCosY = (sHit.cosPsiRecoil * cosY + sHit.sinPsiRecoil * nyL) / rNorm;
+            recCosZ = (sHit.cosPsiRecoil * cosZ + sHit.sinPsiRecoil * nzL) / rNorm;
+          } else {
+            this.totalPhononIonEv += tHit;
+          }
+        }
+        recoilEnergyEv = primaryT;
+        const uxNew = cosX + sumDvX;
+        const uyNew = cosY + sumDvY;
+        const uzNew = cosZ + sumDvZ;
+        const uNorm = Math.sqrt(uxNew * uxNew + uyNew * uyNew + uzNew * uzNew) || 1.0;
+        cosX = uxNew / uNorm;
+        cosY = uyNew / uNorm;
+        cosZ = uzNew / uNorm;
+      } else {
+        const scat = calcMagicScattering(
+          z1,
+          m1,
+          targetEl.z,
+          targetEl.massAmu,
+          energyEv,
+          amorphousImpactParamA,
+          potential
+        );
+        recoilEnergyEv = Math.min(energyEv, scat.recoilEnergyEv);
+        energyEv -= recoilEnergyEv;
+
+        const phi = 2.0 * Math.PI * this.rng();
+        [recCosX, recCosY, recCosZ] = rotateDirection3D(
+          cosX,
+          cosY,
+          cosZ,
+          scat.cosPsiRecoil,
+          scat.sinPsiRecoil,
+          phi + Math.PI
+        );
+        [cosX, cosY, cosZ] = rotateDirection3D(
+          cosX,
+          cosY,
+          cosZ,
+          scat.cosPsiIon,
+          scat.sinPsiIon,
+          phi
+        );
+      }
+
       const elemIdx = this.elemIndexByZ.get(targetEl.z) ?? 0;
-      const pMaxStepA = 1.0 / Math.sqrt(Math.PI * pl.atomDensityPerA3 * jumpLengthA);
-      const impactParamA = pMaxStepA * Math.sqrt(this.rng());
-
-      const scat = calcMagicScattering(
-        z1,
-        m1,
-        targetEl.z,
-        targetEl.massAmu,
-        energyEv,
-        impactParamA
-      );
-
-      const recoilEnergyEv = Math.min(energyEv, scat.recoilEnergyEv);
-      energyEv -= recoilEnergyEv;
-
-      // Azimuthal angle phi in [0, 2*pi)
-      const phi = 2.0 * Math.PI * this.rng();
-
-      // Recoil direction before updating ion direction
-      const [recCosX, recCosY, recCosZ] = rotateDirection3D(
-        cosX,
-        cosY,
-        cosZ,
-        scat.cosPsiRecoil,
-        scat.sinPsiRecoil,
-        phi + Math.PI
-      );
-
-      // Update ion direction
-      [cosX, cosY, cosZ] = rotateDirection3D(
-        cosX,
-        cosY,
-        cosZ,
-        scat.cosPsiIon,
-        scat.sinPsiIon,
-        phi
-      );
-
       const binCol = this.depthToBin(xA);
 
       if (!isCascadeMode) {
-        // Mode 1 (Quick Kinchin-Pease)
+        // Mode 1 (Quick Kinchin-Pease or Nordlund ARC-dpa)
         const kp = calcQuickKinchinPeaseDamage(
           targetEl.z,
           targetEl.massAmu,
           recoilEnergyEv,
           targetEl.displacementEv,
-          targetEl.latticeBindingEv
+          targetEl.latticeBindingEv,
+          useArcDpa
         );
         if (recoilEnergyEv >= targetEl.displacementEv) {
-          // Primary knock-on created by ion
           this.totalDisplacements += kp.vacancies;
           this.totalVacancies += kp.vacancies;
           const isReplacement =
@@ -977,18 +1218,19 @@ export class TrimSimulator {
 
           this.totalIonizRecoilEv += kp.recoilIonizationEv;
           this.totalPhononRecoilEv += kp.recoilPhononEv;
-          this.totalBindingIonEv += targetEl.latticeBindingEv;
+          const ionBind = Math.min(kp.recoilBindingEv, targetEl.latticeBindingEv);
+          this.totalBindingIonEv += ionBind;
           this.totalBindingRecoilEv += Math.max(
             0,
-            kp.recoilBindingEv - targetEl.latticeBindingEv
+            kp.recoilBindingEv - ionBind
           );
 
           if (binCol >= 0) {
             this.histE2Recoil[binCol] += recoilEnergyEv;
             this.histIonizRecoil[binCol] += kp.recoilIonizationEv;
             this.histPhononRecoil[binCol] += kp.recoilPhononEv;
-            this.histVacIon[binCol] += 1.0;
-            const secVac = Math.max(0, kp.vacancies - 1.0);
+            this.histVacIon[binCol] += Math.min(1.0, kp.vacancies);
+            const secVac = Math.max(0, kp.vacancies - Math.min(1.0, kp.vacancies));
             this.histVacRecoil[binCol] += secVac;
             this.histVacByElem[elemIdx][binCol] += kp.vacancies;
             this.histRecoilRangeByElem[elemIdx][binCol] += kp.vacancies;
@@ -997,9 +1239,15 @@ export class TrimSimulator {
               0,
               kp.vacancies - isReplacement
             );
+            // Accumulate DPA in slab for dynamic Crystal-TRIM amorphization
+            if (adv?.dynamicDamage && fluencePerSimIon > 0) {
+              const binAtomsPerCm2 = localAtomDensityA3 * 1e16 * this.binWidthA;
+              this.amorphousDpaByBin[binCol] +=
+                (kp.vacancies * fluencePerSimIon) / Math.max(1e10, binAtomsPerCm2);
+            }
           }
 
-          if (this.collisions.length < 500) {
+          if (this.collisions.length < TrimSimulator.MAX_COLLISIONS) {
             this.collisions.push({
               ionNumber,
               energyKeV: (energyEv + recoilEnergyEv) / 1000.0,
@@ -1025,7 +1273,6 @@ export class TrimSimulator {
         }
       } else {
         // Mode 2 / Mode 3 / Mode 4: Full Recoil Cascade Simulation
-        // Note: In surface sputtering (Mode 2 & 3), recoils with T > Es can still move near the surface even if T < Ed!
         const minCascadeThresholdEv = Math.min(
           targetEl.displacementEv,
           xA < 40.0 ? targetEl.surfaceBindingEv : targetEl.displacementEv
@@ -1063,10 +1310,18 @@ export class TrimSimulator {
             recCosY,
             recCosZ,
             isDisplaced,
-            recordTrack && recoils.length < 60 ? recoils : undefined
+            recordTrack && recoils.length < 60 ? recoils : undefined,
+            potential
           );
 
-          if (this.collisions.length < 500 && isDisplaced) {
+          if (adv?.dynamicDamage && fluencePerSimIon > 0 && binCol >= 0 && isDisplaced) {
+            const binAtomsPerCm2 = localAtomDensityA3 * 1e16 * this.binWidthA;
+            this.amorphousDpaByBin[binCol] +=
+              ((1 + cascadeStats.vacancies) * fluencePerSimIon) /
+              Math.max(1e10, binAtomsPerCm2);
+          }
+
+          if (this.collisions.length < TrimSimulator.MAX_COLLISIONS && isDisplaced) {
             this.collisions.push({
               ionNumber,
               energyKeV: (energyEv + recoilEnergyEv) / 1000.0,
@@ -1122,6 +1377,15 @@ export class TrimSimulator {
         this.histLatY[bin] += Math.abs(yA);
         this.histLatZ[bin] += Math.abs(zA);
         this.histRadialR[bin] += radR;
+        if (adv?.dynamicComposition && fluencePerSimIon > 0) {
+          const plStop = this.getLayerAtDepth(xA);
+          const slabCapacityCm2 = Math.max(1e10, plStop.atomDensityPerA3 * 1e16 * this.binWidthA);
+          this.slabImplantedAtoms[bin] += fluencePerSimIon;
+          this.slabDensityScale[bin] = 1.0 + Math.min(0.5, this.slabImplantedAtoms[bin] / slabCapacityCm2);
+        }
+      }
+      if (crystalActive && totalStepsTaken > 0 && channeledSteps / totalStepsTaken > 0.25) {
+        this.channeledIonCount += 1;
       }
       if (this.stoppedIons.length < TrimSimulator.MAX_STOPPED_MARKERS) {
         this.stoppedIons.push({
@@ -1212,7 +1476,8 @@ export class TrimSimulator {
     initCosY: number,
     initCosZ: number,
     initIsDisplaced: boolean,
-    recoilTracksOut?: TrimRecoilTrack[]
+    recoilTracksOut?: TrimRecoilTrack[],
+    potential: ScreeningPotentialType = 'zbl'
   ): {
     displacements: number;
     vacancies: number;
@@ -1341,6 +1606,15 @@ export class TrimSimulator {
             }
             const escapedEnergyEv = Math.max(0.01, rec.energyEv - esEv);
             this.totalSputteredCount += 1;
+            if (this.config.advancedPhysics?.dynamicComposition) {
+              const l0 = this.preparedLayers[0];
+              const fluenceStep = Math.max(0, this.config.advancedPhysics.doseCm2 || 0) / Math.max(1, this.config.totalIons);
+              const densCm2PerA = Math.max(1e10, (l0?.atomDensityPerA3 ?? 0.05) * 1e16);
+              this.erodedDepthA += fluenceStep / densCm2PerA;
+              if (this.slabDensityScale.length > 0) {
+                this.slabDensityScale[0] = Math.max(0.4, 1.0 - Math.min(0.6, this.erodedDepthA / Math.max(1, this.binWidthA)));
+              }
+            }
             this.sputteredCountByElem[recElemIdx] =
               (this.sputteredCountByElem[recElemIdx] ?? 0) + 1;
             this.sputteredEnergySumByElem[recElemIdx] =
@@ -1429,7 +1703,8 @@ export class TrimSimulator {
           targetEl.z,
           targetEl.massAmu,
           rec.energyEv,
-          impactParamA
+          impactParamA,
+          potential
         );
 
         const tEv = Math.min(rec.energyEv, scat.recoilEnergyEv);
@@ -1673,6 +1948,19 @@ export class TrimSimulator {
       stoppedIons: this.stoppedIons,
       sputteredAtoms: this.sputteredAtoms,
       collisions: this.collisions,
+      advancedDiagnostics: this.config.advancedPhysics
+        ? {
+            amorphousFractionProfile: Array.from(this.amorphousDpaByBin, (dpa) => {
+              const crit = Math.max(1e-4, this.config.advancedPhysics?.criticalDpa || 0.1);
+              return 1.0 - Math.exp(-dpa / crit);
+            }),
+            erodedDepthA: this.erodedDepthA,
+            retainedDoseFraction: this.stoppedCount / nIons,
+            arcDpaVacanciesPerIon: this.totalVacancies / nIons,
+            channeledFractionPct: (this.channeledIonCount * 100.0) / nIons,
+            crystalAxisAlignedCos: this.crystalRotMat ? this.crystalRotMat[0] : undefined,
+          }
+        : undefined,
     };
   }
 }

@@ -146,6 +146,40 @@ export interface TrimCustomDatEvent {
   cosZ: number;
 }
 
+export type CrystalLatticeType = 'diamond' | 'zincblende' | 'wurtzite' | 'fcc' | 'bcc';
+export type CrystalOrientation = '<100>' | '<110>' | '<111>' | '<112>' | 'custom';
+export type ScreeningPotentialType = 'zbl' | 'krc' | 'moliere';
+
+export interface TrimAdvancedPhysicsConfig {
+  // 1. Crystal-TRIM Single-Crystal Channeling & Dynamic Damage
+  crystalMode: boolean;
+  crystalLattice: CrystalLatticeType;
+  latticeConstantA: number;
+  latticeCConstantA?: number;
+  crystalOrientation: CrystalOrientation;
+  customMiller?: [number, number, number];
+  crystalTiltDeg: number; // Fine polar tilt away from crystal axis (e.g. -15 to +15 deg)
+  crystalTwistDeg: number; // Azimuthal wafer twist (0 to 360 deg)
+  targetTempK: number; // Substrate temperature (K) for Debye vibration
+  debyeTempK: number; // Material Debye temperature (K)
+  doseCm2: number; // Fluence (ions/cm^2) for dynamic damage & TRIDYN
+  dynamicDamage: boolean; // Dose-dependent amorphization blocking channeling
+  criticalDpa: number; // Critical dpa for amorphization (~0.1 for Si)
+  // 2. Impact-Parameter Dependent Local Electronic Stopping (Oen-Robinson / Firsov)
+  localElectronicStopping: boolean;
+  // 3. Athermal Frenkel-Pair Recombination (Nordlund ARC-dpa / IAEA)
+  arcDpaRecombination: boolean;
+  // 4. TRIDYN Dynamic Target Composition & Surface Erosion
+  dynamicComposition: boolean;
+  // 5. Interatomic Screening Potential & Simultaneous Weak Collisions
+  screeningPotential: ScreeningPotentialType;
+  simultaneousCollisions: boolean;
+  // 6. 2D Device Mask / Gate Edge Shadowing
+  mask2dEnabled: boolean;
+  maskThicknessA: number;
+  maskOpeningA: number; // Opening aperture width in Y [-W/2, W/2] (nm/A)
+}
+
 export interface TrimSetupConfig {
   title: string;
   ion: TrimIonConfig;
@@ -160,6 +194,7 @@ export interface TrimSetupConfig {
   zones: TrimZoneConfig[];
   layers: TrimLayerConfig[];
   customTrimDatEvents?: TrimCustomDatEvent[];
+  advancedPhysics?: TrimAdvancedPhysicsConfig;
 }
 
 export interface TrimMoments {
@@ -279,4 +314,12 @@ export interface TrimSnapshot {
   stoppedIons: TransmittedIonRecord[];
   sputteredAtoms: TrimSputteredAtom[];
   collisions: TrimCollisionEvent[];
+  advancedDiagnostics?: {
+    amorphousFractionProfile: number[];
+    erodedDepthA: number;
+    retainedDoseFraction: number;
+    arcDpaVacanciesPerIon: number;
+    channeledFractionPct: number;
+    crystalAxisAlignedCos?: number;
+  };
 }

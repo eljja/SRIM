@@ -41,6 +41,10 @@ import {
 } from '../physics/formulaParser';
 import { BOND_DEFINITIONS, calcCoreAndBond } from '../physics/stopping';
 import {
+  DEFAULT_ADVANCED_PHYSICS,
+  inferCrystalPresetForLayer,
+} from '../physics/advancedPhysics';
+import {
   generateTrimIn,
   parseTrimIn,
   generateSimFile,
@@ -50,6 +54,10 @@ import {
 } from '../physics/formats';
 import { PTableModal } from './PTableModal';
 import type {
+  CrystalLatticeType,
+  CrystalOrientation,
+  ScreeningPotentialType,
+  TrimAdvancedPhysicsConfig,
   TrimCalcMode,
   TrimElementConfig,
   TrimLayerConfig,
@@ -85,6 +93,29 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
     | { mode: 'layerElement'; layerIdx: number; elemIdx: number }
     | null
   >(null);
+
+  const advPhysics: TrimAdvancedPhysicsConfig = useMemo(() => {
+    if (config.advancedPhysics) return config.advancedPhysics;
+    const l0 = config.layers[0];
+    const inf = inferCrystalPresetForLayer(l0?.name || 'Si', l0?.elements[0]?.z || 14);
+    return {
+      ...DEFAULT_ADVANCED_PHYSICS,
+      crystalLattice: inf.lattice,
+      latticeConstantA: inf.aA,
+      latticeCConstantA: inf.cA,
+      debyeTempK: inf.debyeTempK,
+    };
+  }, [config.advancedPhysics, config.layers]);
+
+  const updateAdvPhysics = (patch: Partial<TrimAdvancedPhysicsConfig>) => {
+    onChangeConfig({
+      ...config,
+      advancedPhysics: {
+        ...advPhysics,
+        ...patch,
+      },
+    });
+  };
 
   const ionPtable = useMemo(
     () => getPTableElement(config.ion.z1),
@@ -726,6 +757,363 @@ export const SetupStudio: React.FC<SetupStudioProps> = ({
                         Download TRIM.DAT
                       </button>
                     )}
+                </div>
+              )}
+            </div>
+          </div>
+
+          {/* Post-SRIM-2003 Crystal Channeling & Advanced Physics Configuration */}
+          <div className="bg-slate-900/75 border border-indigo-500/30 rounded-2xl p-5 space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2.5">
+              <div className="flex items-center gap-2">
+                <Sparkles className="w-4 h-4 text-indigo-400" />
+                <h2 className="text-sm font-bold text-white">
+                  3. Post-SRIM Crystal Channeling &amp; Advanced Physics
+                </h2>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const l0 = config.layers[0];
+                  const inf = inferCrystalPresetForLayer(
+                    l0?.name || 'Si',
+                    l0?.elements[0]?.z || 14
+                  );
+                  updateAdvPhysics({
+                    crystalMode: true,
+                    crystalLattice: inf.lattice,
+                    latticeConstantA: inf.aA,
+                    latticeCConstantA: inf.cA,
+                    debyeTempK: inf.debyeTempK,
+                  });
+                }}
+                className="text-[10px] px-2 py-0.5 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-500/40 hover:bg-indigo-500/30 font-semibold"
+              >
+                Auto-Detect Layer 1 Crystal
+              </button>
+            </div>
+
+            <div className="space-y-2.5 text-xs">
+              <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/80 border border-slate-800 cursor-pointer">
+                <div>
+                  <div className="font-semibold text-cyan-200">
+                    1) Single-Crystal Lattice &amp; Channeling (Crystal-TRIM)
+                  </div>
+                  <div className="text-[10px] text-slate-400">
+                    Simulates axial/planar channeling, Debye vibration, and dose damage buildup
+                  </div>
+                </div>
+                <input
+                  type="checkbox"
+                  checked={advPhysics.crystalMode}
+                  onChange={(e) => updateAdvPhysics({ crystalMode: e.target.checked })}
+                  className="rounded border-slate-600 text-cyan-500"
+                />
+              </label>
+
+              {advPhysics.crystalMode && (
+                <div className="p-3 rounded-xl bg-slate-950/90 border border-cyan-500/30 space-y-2.5">
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Crystal Structure
+                      </label>
+                      <select
+                        value={advPhysics.crystalLattice}
+                        onChange={(e) =>
+                          updateAdvPhysics({
+                            crystalLattice: e.target.value as CrystalLatticeType,
+                          })
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-white"
+                      >
+                        <option value="diamond">Diamond (Si, Ge, C)</option>
+                        <option value="zincblende">Zincblende (GaAs, InP, 3C-SiC)</option>
+                        <option value="wurtzite">Wurtzite (4H-SiC, GaN, AlN)</option>
+                        <option value="fcc">FCC Metal (Cu, Al, Au)</option>
+                        <option value="bcc">BCC Metal (W, Fe, Mo)</option>
+                      </select>
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Lattice Constant a₀ (Å)
+                      </label>
+                      <input
+                        type="number"
+                        step="0.001"
+                        min={2.0}
+                        max={12.0}
+                        value={advPhysics.latticeConstantA}
+                        onChange={(e) =>
+                          updateAdvPhysics({
+                            latticeConstantA: Math.max(2.0, Number(e.target.value) || 5.431),
+                          })
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-cyan-300"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] text-slate-400 mb-1">
+                      Major Crystal Axis Direction
+                    </label>
+                    <div className="grid grid-cols-5 gap-1">
+                      {(
+                        [
+                          '<100>',
+                          '<110>',
+                          '<111>',
+                          '<112>',
+                          'custom',
+                        ] as CrystalOrientation[]
+                      ).map((ori) => (
+                        <button
+                          key={ori}
+                          type="button"
+                          onClick={() => updateAdvPhysics({ crystalOrientation: ori })}
+                          className={`py-1 rounded text-[11px] font-mono border ${
+                            advPhysics.crystalOrientation === ori
+                              ? 'bg-cyan-600 border-cyan-400 text-white font-bold'
+                              : 'bg-slate-900 border-slate-800 text-slate-300 hover:border-slate-600'
+                          }`}
+                        >
+                          {ori === 'custom' ? '[hkl]' : ori}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {advPhysics.crystalOrientation === 'custom' && (
+                    <div className="grid grid-cols-3 gap-2">
+                      {[0, 1, 2].map((idx) => (
+                        <label key={idx} className="text-[10px] text-slate-400">
+                          {['h', 'k', 'l'][idx]}:
+                          <input
+                            type="number"
+                            value={(advPhysics.customMiller || [1, 0, 0])[idx]}
+                            onChange={(e) => {
+                              const next: [number, number, number] = [
+                                ...(advPhysics.customMiller || [1, 0, 0]),
+                              ];
+                              next[idx] = Number(e.target.value) || 0;
+                              updateAdvPhysics({ customMiller: next });
+                            }}
+                            className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white mt-0.5"
+                          />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+
+                  <div className="grid grid-cols-2 gap-2">
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-400 mb-1">
+                        <span>Fine Axis Tilt (°)</span>
+                        <span className="font-mono text-cyan-300 font-bold">
+                          {advPhysics.crystalTiltDeg.toFixed(1)}°
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={-20}
+                        max={20}
+                        step={0.5}
+                        value={advPhysics.crystalTiltDeg}
+                        onChange={(e) =>
+                          updateAdvPhysics({ crystalTiltDeg: Number(e.target.value) })
+                        }
+                        className="w-full accent-cyan-400"
+                      />
+                    </div>
+                    <div>
+                      <div className="flex justify-between text-[10px] text-slate-400 mb-1">
+                        <span>Wafer Twist φ (°)</span>
+                        <span className="font-mono text-emerald-300 font-bold">
+                          {advPhysics.crystalTwistDeg.toFixed(0)}°
+                        </span>
+                      </div>
+                      <input
+                        type="range"
+                        min={0}
+                        max={360}
+                        step={1}
+                        value={advPhysics.crystalTwistDeg}
+                        onChange={(e) =>
+                          updateAdvPhysics({ crystalTwistDeg: Number(e.target.value) })
+                        }
+                        className="w-full accent-emerald-400"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-3 gap-2">
+                    <div>
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Substrate T (K)
+                      </label>
+                      <input
+                        type="number"
+                        min={10}
+                        max={2000}
+                        value={advPhysics.targetTempK}
+                        onChange={(e) =>
+                          updateAdvPhysics({ targetTempK: Math.max(10, Number(e.target.value) || 300) })
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                      />
+                    </div>
+                    <div>
+                      <label className="block text-[10px] text-slate-400 mb-1">
+                        Fluence Φ (cm⁻²)
+                      </label>
+                      <select
+                        value={advPhysics.doseCm2}
+                        onChange={(e) =>
+                          updateAdvPhysics({ doseCm2: Number(e.target.value) })
+                        }
+                        className="w-full bg-slate-900 border border-slate-700 rounded px-1.5 py-1 text-[11px] font-mono text-amber-300"
+                      >
+                        {[1e12, 1e13, 1e14, 1e15, 1e16, 1e17, 5e17].map((d) => (
+                          <option key={d} value={d}>
+                            {d.toExponential(0)}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <label className="flex flex-col justify-end pb-1">
+                      <span className="text-[10px] text-slate-400 mb-1">Dynamic Dmg</span>
+                      <input
+                        type="checkbox"
+                        checked={advPhysics.dynamicDamage}
+                        onChange={(e) =>
+                          updateAdvPhysics({ dynamicDamage: e.target.checked })
+                        }
+                        className="rounded border-slate-600 text-cyan-500 h-4 w-4"
+                      />
+                    </label>
+                  </div>
+                </div>
+              )}
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer">
+                  <span className="text-[11px] text-slate-200">2) Oen–Robinson Sₑ(b)</span>
+                  <input
+                    type="checkbox"
+                    checked={advPhysics.localElectronicStopping}
+                    onChange={(e) =>
+                      updateAdvPhysics({ localElectronicStopping: e.target.checked })
+                    }
+                    className="rounded border-slate-600 text-cyan-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer">
+                  <span className="text-[11px] text-slate-200">3) Nordlund ARC-dpa</span>
+                  <input
+                    type="checkbox"
+                    checked={advPhysics.arcDpaRecombination}
+                    onChange={(e) =>
+                      updateAdvPhysics({ arcDpaRecombination: e.target.checked })
+                    }
+                    className="rounded border-slate-600 text-emerald-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer">
+                  <span className="text-[11px] text-slate-200">4) TRIDYN Dynamic</span>
+                  <input
+                    type="checkbox"
+                    checked={advPhysics.dynamicComposition}
+                    onChange={(e) =>
+                      updateAdvPhysics({ dynamicComposition: e.target.checked })
+                    }
+                    className="rounded border-slate-600 text-amber-500"
+                  />
+                </label>
+
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer">
+                  <span className="text-[11px] text-slate-200">5) MARLOWE Sim-BCA</span>
+                  <input
+                    type="checkbox"
+                    checked={advPhysics.simultaneousCollisions}
+                    onChange={(e) =>
+                      updateAdvPhysics({ simultaneousCollisions: e.target.checked })
+                    }
+                    className="rounded border-slate-600 text-purple-500"
+                  />
+                </label>
+              </div>
+
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-[10px] text-slate-400 mb-1">
+                    5) Screening Potential
+                  </label>
+                  <select
+                    value={advPhysics.screeningPotential}
+                    onChange={(e) =>
+                      updateAdvPhysics({
+                        screeningPotential: e.target.value as ScreeningPotentialType,
+                      })
+                    }
+                    className="w-full bg-slate-950 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                  >
+                    <option value="zbl">ZBL Universal</option>
+                    <option value="krc">Kr-C (Wilson–Haggmark)</option>
+                    <option value="moliere">Molière (Channeling)</option>
+                  </select>
+                </div>
+                <label className="flex items-center justify-between p-2 rounded-lg bg-slate-950/70 border border-slate-800 cursor-pointer mt-3">
+                  <span className="text-[11px] text-slate-200">6) 2D Mask Window</span>
+                  <input
+                    type="checkbox"
+                    checked={advPhysics.mask2dEnabled}
+                    onChange={(e) =>
+                      updateAdvPhysics({ mask2dEnabled: e.target.checked })
+                    }
+                    className="rounded border-slate-600 text-indigo-500"
+                  />
+                </label>
+              </div>
+
+              {advPhysics.mask2dEnabled && (
+                <div className="grid grid-cols-2 gap-2 p-2.5 rounded-lg bg-slate-950 border border-indigo-500/30">
+                  <div>
+                    <label className="block text-[10px] text-slate-400 mb-1">
+                      Mask Thickness (Å)
+                    </label>
+                    <input
+                      type="number"
+                      min={10}
+                      max={10000}
+                      value={advPhysics.maskThicknessA}
+                      onChange={(e) =>
+                        updateAdvPhysics({
+                          maskThicknessA: Math.max(10, Number(e.target.value) || 300),
+                        })
+                      }
+                      className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-[10px] text-slate-400 mb-1">
+                      Aperture Opening W (Å)
+                    </label>
+                    <input
+                      type="number"
+                      min={10}
+                      max={50000}
+                      value={advPhysics.maskOpeningA}
+                      onChange={(e) =>
+                        updateAdvPhysics({
+                          maskOpeningA: Math.max(10, Number(e.target.value) || 500),
+                        })
+                      }
+                      className="w-full bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs font-mono text-white"
+                    />
+                  </div>
                 </div>
               )}
             </div>
