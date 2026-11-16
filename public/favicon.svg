@@ -1,0 +1,37 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <radialGradient id="bg" cx="35%" cy="30%" r="75%">
+      <stop offset="0%" stop-color="#0f172a" />
+      <stop offset="100%" stop-color="#020617" />
+    </radialGradient>
+    <linearGradient id="beam" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e0f2fe" />
+      <stop offset="100%" stop-color="#22d3ee" />
+    </linearGradient>
+    <linearGradient id="recoil" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#fbbf24" />
+      <stop offset="100%" stop-color="#f97316" />
+    </linearGradient>
+  </defs>
+
+  <!-- App badge background -->
+  <rect x="2" y="2" width="60" height="60" rx="14" fill="url(#bg)" stroke="#0891b2" stroke-width="2.5" />
+
+  <!-- Subtle wafer target zone on right -->
+  <rect x="20" y="9" width="35" height="46" rx="6" fill="#0ea5e9" fill-opacity="0.10" stroke="#1e293b" stroke-width="1.5" />
+  <line x1="20" y1="9" x2="20" y2="55" stroke="#38bdf8" stroke-opacity="0.55" stroke-width="2" />
+
+  <!-- Recoil collision sub-cascades -->
+  <polyline points="29,29 39,18 48,21" fill="none" stroke="url(#recoil)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+  <polyline points="35,34 40,46 49,49" fill="none" stroke="url(#recoil)" stroke-width="3" stroke-linecap="round" stroke-linejoin="round" />
+  <line x1="40" y1="36" x2="47" y2="30" stroke="#ec4899" stroke-width="2.4" stroke-linecap="round" />
+
+  <!-- Incident ion beam & primary Monte Carlo trajectory -->
+  <polyline points="8,24 20,27 29,29 35,34 45,38" fill="none" stroke="url(#beam)" stroke-width="4" stroke-linecap="round" stroke-linejoin="round" />
+
+  <!-- Beam entry point & stopped ion end marker -->
+  <circle cx="20" cy="27" r="3" fill="#38bdf8" />
+  <circle cx="46" cy="38" r="4.5" fill="#34d399" stroke="#020617" stroke-width="1.5" />
+  <circle cx="48" cy="21" r="2.2" fill="#fbbf24" />
+  <circle cx="49" cy="49" r="2.2" fill="#f97316" />
+</svg>
