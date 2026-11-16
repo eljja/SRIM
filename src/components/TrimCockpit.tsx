@@ -15,7 +15,7 @@ import {
   Layers,
   FileSpreadsheet,
 } from 'lucide-react';
-import { TrimSimulator } from '../physics/trim';
+import { RunningMoments, TrimSimulator } from '../physics/trim';
 import { calcEsumAnalysis, calcTransmitAnalysis } from '../physics/pral';
 import { generateAllTrimOutputs } from '../physics/formats';
 import { generateSvgLinePlot, generateCsvData, downloadFile } from '../physics/exportUtils';
@@ -88,6 +88,30 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
   const webGpuEnabledRef = useRef(webGpuEnabled);
   webGpuEnabledRef.current = webGpuEnabled;
   const inFlightRef = useRef<boolean>(false);
+  const completedIonsRef = useRef<number>(snapshot.completedIons);
+  completedIonsRef.current = snapshot.completedIons;
+
+  const gpuAccumRef = useRef({
+    ionizEv: 0,
+    phononEv: 0,
+    bindingEv: 0,
+    vacancies: 0,
+    absLatM: new RunningMoments(),
+    latM: new RunningMoments(),
+    radM: new RunningMoments(),
+  });
+
+  const resetGpuAccum = () => {
+    gpuAccumRef.current = {
+      ionizEv: 0,
+      phononEv: 0,
+      bindingEv: 0,
+      vacancies: 0,
+      absLatM: new RunningMoments(),
+      latM: new RunningMoments(),
+      radM: new RunningMoments(),
+    };
+  };
 
   useEffect(() => {
     setGpuSupported(isWebGpuSupported());
@@ -137,9 +161,11 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
     });
   };
 
-  // Sync totalIons updates mid-run without resetting completed ions
+  // Sync totalIons updates mid-run without resetting completed ions (both CPU worker & active WebGPU state)
   useEffect(() => {
-    if (workerRef.current) {
+    if (webGpuEnabledRef.current) {
+      setSnapshot((prev) => ({ ...prev, totalIons: config.totalIons }));
+    } else if (workerRef.current) {
       workerRef.current.postMessage({
         type: 'SET_TOTAL_IONS',
         totalIons: config.totalIons,
@@ -154,6 +180,7 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
   useEffect(() => {
     setIsRunning(false);
     inFlightRef.current = false;
+    resetGpuAccum();
     const activeConfig = configRef.current;
 
     try {
@@ -252,17 +279,22 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
 
     const kickLoop = () => {
       if (cancelled || !isRunningRef.current) return;
-      const remaining = configRef.current.totalIons - snapshot.completedIons;
+      const remaining = configRef.current.totalIons - completedIonsRef.current;
       if (remaining <= 0) {
         setIsRunning(false);
         return;
       }
 
-      if (webGpuEnabled && gpuRunnerRef.current?.ready) {
-        const dispatchCount = Math.min(batchSpeedRef.current, remaining);
-        const l0 = config.layers[0];
+      if (webGpuEnabledRef.current && gpuRunnerRef.current?.ready) {
+        const requestedGpuBatch = Math.max(
+          batchSpeedRef.current,
+          configRef.current.totalIons >= 10000 ? 1000 : batchSpeedRef.current
+        );
+        const dispatchCount = Math.max(1, Math.min(requestedGpuBatch, remaining));
+        const l0 = configRef.current.layers[0];
         const el0 = l0?.elements[0];
-        const totalW = config.layers.reduce((a, b) => a + b.widthA, 0) || 1000;
+        const totalW =
+          configRef.current.layers.reduce((a, b) => a + b.widthA, 0) || 1000;
         const potCode =
           activeAdvPhysics.screeningPotential === 'krc'
             ? 1
@@ -271,10 +303,10 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
             : 0;
         gpuRunnerRef.current
           .runBatch(dispatchCount, {
-            z1: config.ion.z1,
-            m1: config.ion.massAmu,
-            energyEv: config.ion.energyKeV * 1000.0,
-            angleRad: (config.ion.angleDeg * Math.PI) / 180.0,
+            z1: configRef.current.ion.z1,
+            m1: configRef.current.ion.massAmu,
+            energyEv: configRef.current.ion.energyKeV * 1000.0,
+            angleRad: (configRef.current.ion.angleDeg * Math.PI) / 180.0,
             z2: gpuLut.meanZ2 || el0?.z || 14,
             m2: gpuLut.meanM2 || el0?.massAmu || 28.086,
             atomDensityA3: gpuLut.atomDensityA3 || 0.05,
@@ -287,45 +319,125 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
           })
           .then((res) => {
             if (cancelled) return;
+            const gAcc = gpuAccumRef.current;
+            gAcc.ionizEv += res.totalIonizEv;
+            gAcc.phononEv += res.totalPhononEv;
+            gAcc.bindingEv += res.totalBindingEv;
+            gAcc.vacancies += res.totalVacancies;
+
+            // Update lateral & radial moments from stopped (fate===0) ions in GPU batch
+            for (let i = 0; i < res.stoppedX.length; i++) {
+              if ((res.stoppedFate[i] ?? 0) === 0) {
+                const yA = res.stoppedY[i];
+                const zA = res.stoppedZ[i];
+                gAcc.absLatM.push(Math.abs(yA));
+                gAcc.latM.push(yA);
+                gAcc.radM.push(Math.sqrt(yA * yA + zA * zA));
+              }
+            }
+
+            let finishedTarget = false;
             setSnapshot((prev) => {
-              const nextCompleted = prev.completedIons + dispatchCount;
+              const prevCompleted = prev.completedIons;
+              const nextCompleted = Math.min(
+                configRef.current.totalIons,
+                prevCompleted + dispatchCount
+              );
+              completedIonsRef.current = nextCompleted;
+              finishedTarget = nextCompleted >= configRef.current.totalIons;
+
+              const totalStopped = prev.stoppedCount + res.stoppedCount;
               const newStoppedIons = [...prev.stoppedIons];
+              let seenStopped = prev.stoppedCount;
               for (let i = 0; i < res.stoppedX.length; i++) {
+                if ((res.stoppedFate[i] ?? 0) !== 0) continue;
+                seenStopped++;
+                const rec = {
+                  ionNumber: prevCompleted + i + 1,
+                  z1: configRef.current.ion.z1,
+                  energyEv: 0,
+                  xA: res.stoppedX[i],
+                  yA: res.stoppedY[i],
+                  zA: res.stoppedZ[i],
+                  cosX: 1,
+                  cosY: 0,
+                  cosZ: 0,
+                };
                 if (newStoppedIons.length < 4000) {
-                  newStoppedIons.push({
-                    ionNumber: prev.completedIons + i + 1,
-                    z1: config.ion.z1,
-                    energyEv: 0,
-                    xA: res.stoppedX[i],
-                    yA: res.stoppedY[i],
-                    zA: res.stoppedZ[i],
-                    cosX: 1,
-                    cosY: 0,
-                    cosZ: 0,
-                  });
+                  newStoppedIons.push(rec);
+                } else {
+                  const rIdx = Math.floor(Math.random() * seenStopped);
+                  if (rIdx < 4000) newStoppedIons[rIdx] = rec;
                 }
               }
-              const oldNorm = 1e8 / (Math.max(1, prev.completedIons) * prev.binWidthA);
-              const rangeNormCmInv = 1e8 / (Math.max(1, nextCompleted) * prev.binWidthA);
-              const mergedCounts = prev.histograms.ionRange.map(
-                (oldVal, b) => (oldVal / oldNorm) + (res.rangeHist[b] || 0)
+
+              // Merge real 3D trajectories generated on GPU (up to 500 via reservoir sampling)
+              const nextTrajectories = [...prev.trajectories];
+              let seenTracks = prevCompleted;
+              for (let t = 0; t < res.sampleTracks.length; t++) {
+                seenTracks++;
+                const tr = {
+                  ...res.sampleTracks[t],
+                  ionNumber: prevCompleted + t + 1,
+                };
+                if (nextTrajectories.length < 500) {
+                  nextTrajectories.push(tr);
+                } else {
+                  const rIdx = Math.floor(Math.random() * seenTracks);
+                  if (rIdx < 500) nextTrajectories[rIdx] = tr;
+                }
+              }
+
+              const bw = Math.max(0.1, prev.binWidthA);
+              const oldRangeNorm = 1e8 / (Math.max(1, prevCompleted) * bw);
+              const newRangeNorm = 1e8 / (Math.max(1, nextCompleted) * bw);
+              const mergedRangeCounts = prev.histograms.ionRange.map(
+                (oldVal, b) =>
+                  (prevCompleted > 0 ? oldVal / oldRangeNorm : 0) +
+                  (res.rangeHist[b] || 0)
               );
-              const mergedHist = mergedCounts.map((c) => c * rangeNormCmInv);
-              // Compute range moments from histogram bin centers
+              const mergedRangeHist = mergedRangeCounts.map(
+                (c) => c * newRangeNorm
+              );
+
+              const oldDepthNorm = 1.0 / (Math.max(1, prevCompleted) * bw);
+              const newDepthNorm = 1.0 / (Math.max(1, nextCompleted) * bw);
+              const mergeDepthArr = (oldArr: number[], addArr: number[]) =>
+                oldArr.map(
+                  (oldVal, b) =>
+                    ((prevCompleted > 0 ? oldVal / oldDepthNorm : 0) +
+                      (addArr[b] || 0)) *
+                    newDepthNorm
+                );
+
+              const nextIonizHist = mergeDepthArr(
+                prev.histograms.ionizationIon,
+                res.ionizationHist
+              );
+              const nextPhononHist = mergeDepthArr(
+                prev.histograms.phononsIon,
+                res.phononHist
+              );
+              const nextVacHist = mergeDepthArr(
+                prev.histograms.vacanciesIon,
+                res.vacancyHist
+              );
+
               let countSum = 0;
               let sumX = 0;
-              for (let b = 0; b < mergedCounts.length; b++) {
-                countSum += mergedCounts[b];
-                sumX += mergedCounts[b] * (prev.binDepthsA[b] || 0);
+              for (let b = 0; b < mergedRangeCounts.length; b++) {
+                countSum += mergedRangeCounts[b];
+                sumX += mergedRangeCounts[b] * (prev.binDepthsA[b] || 0);
               }
-              const meanA = countSum > 0 ? sumX / countSum : prev.rangeMoments.meanA;
+              const meanA =
+                countSum > 0 ? sumX / countSum : prev.rangeMoments.meanA;
               let m2 = 0;
               let m3 = 0;
               let m4 = 0;
               if (countSum > 0) {
-                for (let b = 0; b < mergedCounts.length; b++) {
+                for (let b = 0; b < mergedRangeCounts.length; b++) {
                   const d = (prev.binDepthsA[b] || 0) - meanA;
-                  const c = mergedCounts[b];
+                  const c = mergedRangeCounts[b];
                   m2 += c * d * d;
                   m3 += c * d * d * d;
                   m4 += c * d * d * d * d;
@@ -340,26 +452,68 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
               const kurtosis =
                 stragglingA > 1e-9 ? m4 / Math.pow(stragglingA, 4) : 3;
 
+              const absLatRes = gAcc.absLatM.getMoments();
+              const latRes = gAcc.latM.getMoments();
+              const radRes = gAcc.radM.getMoments();
+
+              const totalGpuLoss = Math.max(
+                1.0,
+                gAcc.ionizEv + gAcc.phononEv + gAcc.bindingEv
+              );
+
               return {
                 ...prev,
                 completedIons: nextCompleted,
-                stoppedCount: prev.stoppedCount + res.stoppedCount,
+                stoppedCount: totalStopped,
                 backscatteredCount: prev.backscatteredCount + res.backscatterCount,
                 transmittedCount: prev.transmittedCount + res.transmitCount,
-                stoppedPct: ((prev.stoppedCount + res.stoppedCount) * 100) / nextCompleted,
+                stoppedPct: (totalStopped * 100) / Math.max(1, nextCompleted),
                 backscatteredPct:
-                  ((prev.backscatteredCount + res.backscatterCount) * 100) / nextCompleted,
+                  ((prev.backscatteredCount + res.backscatterCount) * 100) /
+                  Math.max(1, nextCompleted),
                 transmittedPct:
-                  ((prev.transmittedCount + res.transmitCount) * 100) / nextCompleted,
+                  ((prev.transmittedCount + res.transmitCount) * 100) /
+                  Math.max(1, nextCompleted),
+                totalVacancies: gAcc.vacancies,
+                totalDisplacements: gAcc.vacancies,
+                totalInterstitials: gAcc.vacancies,
+                vacanciesPerIon: gAcc.vacancies / Math.max(1, nextCompleted),
+                displacementsPerIon: gAcc.vacancies / Math.max(1, nextCompleted),
+                interstitialsPerIon: gAcc.vacancies / Math.max(1, nextCompleted),
+                energyLossIonizationPct: (gAcc.ionizEv * 100) / totalGpuLoss,
+                energyLossPhononsPct: (gAcc.phononEv * 100) / totalGpuLoss,
+                energyLossBindingPct: (gAcc.bindingEv * 100) / totalGpuLoss,
+                energyIonizByIonPct: (gAcc.ionizEv * 100) / totalGpuLoss,
+                energyPhononByIonPct: (gAcc.phononEv * 100) / totalGpuLoss,
+                energyBindingByIonPct: (gAcc.bindingEv * 100) / totalGpuLoss,
                 rangeMoments: { meanA, stragglingA, skewness, kurtosis },
+                lateralMoments: {
+                  meanA: absLatRes.meanA,
+                  stragglingA: latRes.stragglingA,
+                  skewness: latRes.skewness,
+                  kurtosis: latRes.kurtosis,
+                },
+                radialMoments: radRes,
+                trajectories: nextTrajectories,
                 stoppedIons: newStoppedIons,
                 histograms: {
                   ...prev.histograms,
-                  ionRange: mergedHist,
+                  ionRange: mergedRangeHist,
+                  ionizationIon: nextIonizHist,
+                  phononsIon: nextPhononHist,
+                  vacanciesIon: nextVacHist,
                 },
               };
             });
-            timerId = window.setTimeout(kickLoop, 16);
+
+            if (
+              completedIonsRef.current >= configRef.current.totalIons ||
+              finishedTarget
+            ) {
+              setIsRunning(false);
+            } else {
+              timerId = window.setTimeout(kickLoop, 16);
+            }
           })
           .catch(() => {
             setWebGpuEnabled(false);
@@ -415,6 +569,8 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
 
   const handleReset = () => {
     setIsRunning(false);
+    resetGpuAccum();
+    completedIonsRef.current = 0;
     if (workerRef.current) {
       workerRef.current.postMessage({ type: 'INIT', config } satisfies TrimWorkerRequest);
     } else {
@@ -479,7 +635,7 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={() => setIsRunning(!isRunning)}
-            disabled={snapshot.completedIons >= config.totalIons}
+            disabled={!isRunning && snapshot.completedIons >= config.totalIons}
             className={`flex items-center gap-2 px-4 py-2 rounded-xl text-xs font-bold shadow-lg transition-all ${
               isRunning
                 ? 'bg-amber-500 hover:bg-amber-400 text-slate-950'
@@ -933,6 +1089,7 @@ export const TrimCockpit: React.FC<TrimCockpitProps> = ({
           <TrajectoryViewer3D
             layers={config.layers}
             trajectories={snapshot.trajectories}
+            stoppedIons={snapshot.stoppedIons}
             maxDepthA={
               config.plotXMaxA ||
               config.layers.reduce((a, b) => a + b.widthA, 0)

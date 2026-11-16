@@ -786,7 +786,11 @@ export class TrimSimulator {
       cosZ = ev.cosZ / norm;
     }
 
-    const recordTrack = this.trajectories.length < TrimSimulator.MAX_TRAJECTORIES;
+    const trackReplaceIdx =
+      this.trajectories.length < TrimSimulator.MAX_TRAJECTORIES
+        ? this.trajectories.length
+        : Math.floor(this.rng() * ionNumber);
+    const recordTrack = trackReplaceIdx < TrimSimulator.MAX_TRAJECTORIES;
     const points: TrimPoint3D[] = recordTrack
       ? [{ xA, yA, zA, energyEv }]
       : [];
@@ -1449,14 +1453,19 @@ export class TrimSimulator {
     }
 
     if (recordTrack) {
-      this.trajectories.push({
+      const trajObj: TrimTrajectory = {
         ionNumber,
         eventName,
         z1,
         fate,
         points,
         recoils,
-      });
+      };
+      if (trackReplaceIdx < this.trajectories.length) {
+        this.trajectories[trackReplaceIdx] = trajObj;
+      } else {
+        this.trajectories.push(trajObj);
+      }
     }
   }
 

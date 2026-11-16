@@ -9,11 +9,16 @@ import {
   Crosshair,
   Camera,
 } from 'lucide-react';
-import type { TrimLayerConfig, TrimTrajectory } from '../physics/types';
+import type {
+  TransmittedIonRecord,
+  TrimLayerConfig,
+  TrimTrajectory,
+} from '../physics/types';
 
 interface TrajectoryViewer3DProps {
   layers: TrimLayerConfig[];
   trajectories: TrimTrajectory[];
+  stoppedIons?: TransmittedIonRecord[];
   maxDepthA: number;
 }
 
@@ -55,6 +60,7 @@ function chooseScaleBar(pxPerA: number): { lengthA: number; px: number; label: s
 export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
   layers,
   trajectories,
+  stoppedIons = [],
   maxDepthA,
 }) => {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -364,6 +370,41 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
       ctx.globalAlpha = 1.0;
     }
 
+    // 3b. Draw Reservoir-Sampled Stopped Ion 3D Point Cloud (continues updating cleanly from 1k -> 10k -> 1M and in WebGPU mode)
+    if (showStoppedMarkers && stoppedIons.length > 0) {
+      const dotRadius = detailedVertices ? 4.0 : stoppedIons.length > 1000 ? 1.8 : 2.3;
+      ctx.fillStyle = '#34d399';
+      ctx.globalAlpha = stoppedIons.length > 1000 ? 0.72 : 0.9;
+      for (let i = 0; i < stoppedIons.length; i++) {
+        const s = stoppedIons[i];
+        const [ex, ey] = projectPoint(s.xA, s.yA, s.zA);
+        if (ex < -15 || ex > width + 15 || ey < -15 || ey > height + 15) continue;
+        ctx.beginPath();
+        ctx.arc(ex, ey, dotRadius, 0, Math.PI * 2);
+        ctx.fill();
+        if (detailedVertices) {
+          ctx.strokeStyle = '#6ee7b7';
+          ctx.lineWidth = 1.0;
+          ctx.beginPath();
+          ctx.moveTo(ex - 7, ey);
+          ctx.lineTo(ex + 7, ey);
+          ctx.moveTo(ex, ey - 7);
+          ctx.lineTo(ex, ey + 7);
+          ctx.stroke();
+          if (detailedIonLabels) {
+            ctx.font = '600 10px monospace';
+            ctx.fillStyle = '#a7f3d0';
+            ctx.fillText(
+              `#${s.ionNumber} (${s.xA.toFixed(1)}, ${s.yA.toFixed(1)}, ${s.zA.toFixed(1)} Å)`,
+              ex + 9,
+              ey + 3
+            );
+          }
+        }
+      }
+      ctx.globalAlpha = 1.0;
+    }
+
     // 4. Physical Scale Bar & Magnification HUD (Top-Left, clear of bottom legend)
     const effectiveScaleFactor = viewMode === '3D' ? scale : scale * 1.2;
     const pxPerA = effectiveScaleFactor / depthMax;
@@ -405,6 +446,7 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
   }, [
     layers,
     trajectories,
+    stoppedIons,
     maxDepthA,
     viewMode,
     showIons,
@@ -417,15 +459,23 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
   ]);
 
   const handleFocusSingleIon = () => {
-    const stoppedTrajs = trajectories.filter(
-      (t) => t.fate === 'stopped' && t.points.length > 0
-    );
-    const pool = stoppedTrajs.length > 0 ? stoppedTrajs : trajectories;
-    if (pool.length === 0) return;
-    const idx = focusIonIdx % pool.length;
-    setFocusIonIdx((prev) => prev + 1);
-    const targetTraj = pool[idx];
-    const lastPt = targetTraj.points[targetTraj.points.length - 1];
+    let lastPt: { xA: number; yA: number; zA: number } | null = null;
+    if (stoppedIons.length > 0) {
+      const s = stoppedIons[focusIonIdx % stoppedIons.length];
+      lastPt = { xA: s.xA, yA: s.yA, zA: s.zA };
+      setFocusIonIdx((prev) => prev + 1);
+    } else {
+      const stoppedTrajs = trajectories.filter(
+        (t) => t.fate === 'stopped' && t.points.length > 0
+      );
+      const pool = stoppedTrajs.length > 0 ? stoppedTrajs : trajectories;
+      if (pool.length === 0) return;
+      const idx = focusIonIdx % pool.length;
+      setFocusIonIdx((prev) => prev + 1);
+      const targetTraj = pool[idx];
+      lastPt = targetTraj.points[targetTraj.points.length - 1];
+    }
+    if (!lastPt) return;
 
     const canvas = canvasRef.current;
     const width = canvas?.clientWidth || 720;
@@ -483,7 +533,7 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
             3D Collision Cascade & Ion Trajectory Visualizer
           </span>
           <span className="text-[10px] px-2 py-0.5 rounded bg-slate-800 text-cyan-300 font-mono">
-            {trajectories.length} Tracks
+            {trajectories.length} Tracks · {stoppedIons.length.toLocaleString()} Dots
           </span>
         </div>
 
@@ -563,7 +613,7 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
 
           <button
             onClick={handleFocusSingleIon}
-            disabled={trajectories.length === 0}
+            disabled={trajectories.length === 0 && stoppedIons.length === 0}
             title="Zoom straight into an individual stopped ion atom (~25 Å FOV); click again to cycle ions"
             className="flex items-center gap-1 px-2 py-1 rounded bg-emerald-950/70 hover:bg-emerald-900/70 border border-emerald-500/50 text-emerald-200 text-[11px] font-semibold disabled:opacity-40"
           >

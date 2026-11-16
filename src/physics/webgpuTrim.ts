@@ -1,5 +1,5 @@
 import { calcLayerStopping } from './stopping';
-import type { TrimSetupConfig } from './types';
+import type { TrimPoint3D, TrimSetupConfig, TrimTrajectory } from './types';
 
 export interface WebGpuParams {
   z1: number;
@@ -21,13 +21,25 @@ export interface WebGpuParams {
 
 export interface WebGpuBatchResult {
   rangeHist: number[];
+  ionizationHist: number[];
+  phononHist: number[];
+  vacancyHist: number[];
   stoppedX: number[];
   stoppedY: number[];
   stoppedZ: number[];
+  stoppedFate: number[];
+  sampleTracks: TrimTrajectory[];
   stoppedCount: number;
   backscatterCount: number;
   transmitCount: number;
+  totalIonizEv: number;
+  totalPhononEv: number;
+  totalBindingEv: number;
+  totalVacancies: number;
 }
+
+const GPU_TRACK_COUNT = 64;
+const GPU_TRACK_MAX_VERTS = 24;
 
 /**
  * Checks if WebGPU is available in the current browser/runtime.
@@ -90,7 +102,8 @@ export function buildGpuStoppingTable(config: TrimSetupConfig, layerIdx: number 
 /**
  * Full-Fidelity WGSL Compute Shader for Monte Carlo Binary Collision Approximation (BCA).
  * Implements ZBL / Kr-C / Moliere screening with Newton-Raphson closest approach x0,
- * Biersack-Haggmark Magic Formula scattering, exact 3D direction rotation, and tabulated SCOEF03 Se(E).
+ * Biersack-Haggmark Magic Formula scattering, exact 3D direction rotation, tabulated SCOEF03 Se(E),
+ * Kinchin-Pease NRT damage/ionization/phonon depth histograms, and 3D sample track recording.
  */
 export const WGSL_TRIM_SHADER = `
 struct SimParams {
@@ -108,7 +121,7 @@ struct SimParams {
   batchCount: u32,
   seedBase: u32,
   potentialCode: u32, // 0=ZBL, 1=Kr-C, 2=Moliere
-  pad1: u32,
+  ebEv: f32,
   pad2: u32,
 };
 
@@ -116,14 +129,18 @@ struct StoppedIon {
   x: f32,
   y: f32,
   z: f32,
-  fate: u32, // 0 = stopped, 1 = backscattered, 2 = transmitted
+  fate: u32, // lower 4 bits = fate (0=stopped,1=BS,2=TR); upper bits = vertCount for tracks
 };
 
 @group(0) @binding(0) var<uniform> params: SimParams;
-@group(0) @binding(1) var<storage, read_write> histBins: array<atomic<u32>, 100>;
+// 0..99 = range count, 100..199 = ionization eV, 200..299 = phonon eV, 300..399 = vacancies * 10
+@group(0) @binding(1) var<storage, read_write> histAll: array<atomic<u32>, 400>;
 @group(0) @binding(2) var<storage, read_write> stoppedIons: array<StoppedIon>;
-@group(0) @binding(3) var<storage, read_write> globalCounters: array<atomic<u32>, 4>;
+// [0]=stopped, [1]=backscatter, [2]=transmit, [3]=totalCompleted, [4]=bindingEv (stochastic)
+@group(0) @binding(3) var<storage, read_write> globalCounters: array<atomic<u32>, 8>;
 @group(0) @binding(4) var<storage, read> seTable: array<f32, 128>;
+// Up to 64 sample trajectories * 24 vertices * vec4(x, y, z, energyEv)
+@group(0) @binding(5) var<storage, read_write> trackVerts: array<vec4<f32>, 1536>;
 
 fn pcg32(state: ptr<function, u32>) -> f32 {
   let old = *state;
@@ -135,20 +152,17 @@ fn pcg32(state: ptr<function, u32>) -> f32 {
 
 fn evalScreening(x: f32, pot: u32) -> vec2<f32> {
   if (pot == 1u) {
-    // Wilson-Haggmark-Biersack Kr-C
     let t0 = 0.190945 * exp(-0.278544 * x);
     let t1 = 0.473674 * exp(-0.637174 * x);
     let t2 = 0.335381 * exp(-1.919249 * x);
     return vec2<f32>(t0 + t1 + t2, -(0.278544 * t0 + 0.637174 * t1 + 1.919249 * t2));
   }
   if (pot == 2u) {
-    // Moliere
     let t0 = 0.35 * exp(-0.3 * x);
     let t1 = 0.55 * exp(-1.2 * x);
     let t2 = 0.10 * exp(-6.0 * x);
     return vec2<f32>(t0 + t1 + t2, -(0.3 * t0 + 1.2 * t1 + 6.0 * t2));
   }
-  // ZBL Universal
   let t0 = 0.18175 * exp(-3.1998 * x);
   let t1 = 0.50986 * exp(-0.94229 * x);
   let t2 = 0.28022 * exp(-0.4029 * x);
@@ -158,7 +172,6 @@ fn evalScreening(x: f32, pot: u32) -> vec2<f32> {
   return vec2<f32>(phi, dphi);
 }
 
-// Lookup tabulated SCOEF03 Se(E) in eV/A
 fn lookupSeEvPerA(energyEv: f32) -> f32 {
   let eMax = max(100.0, params.energyEv);
   let eClamped = max(5.0, min(eMax, energyEv));
@@ -170,7 +183,6 @@ fn lookupSeEvPerA(energyEv: f32) -> f32 {
   return seTable[i0] * (1.0 - frac) + seTable[i1] * frac;
 }
 
-// ZBL / Kr-C / Moliere Biersack-Haggmark Magic Formula scattering
 fn magicScatteringSinHalfTheta(eps: f32, bRed: f32, pot: u32) -> f32 {
   if (bRed <= 1e-6) {
     return 1.0;
@@ -211,7 +223,6 @@ fn magicScatteringSinHalfTheta(eps: f32, bRed: f32, pot: u32) -> f32 {
   return sqrt(max(0.0, 1.0 - cosHalf * cosHalf));
 }
 
-// Exact 3D rotation of unit vector (cx, cy, cz) by polar Psi and azimuthal Phi
 fn rotateDir3D(d: vec3<f32>, cosPsi: f32, sinPsi: f32, phi: f32) -> vec3<f32> {
   let cosPhi = cos(phi);
   let sinPhi = sin(phi);
@@ -226,6 +237,15 @@ fn rotateDir3D(d: vec3<f32>, cosPsi: f32, sinPsi: f32, phi: f32) -> vec3<f32> {
     out.z = d.z * cosPsi + (sinPsi * (d.x * d.z * cosPhi + d.y * sinPhi)) / sinTheta0;
   }
   return normalize(out);
+}
+
+fn addHistStochastic(baseOffset: u32, xPosA: f32, val: f32, rng: ptr<function, u32>) {
+  if (val <= 0.0 || xPosA < 0.0 || xPosA >= params.targetWidthA) { return; }
+  let b = u32(clamp(xPosA / params.binWidthA, 0.0, 99.0));
+  let rounded = u32(max(0.0, val + pcg32(rng)));
+  if (rounded > 0u) {
+    atomicAdd(&histAll[baseOffset + b], rounded);
+  }
 }
 
 @compute @workgroup_size(64)
@@ -245,6 +265,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   let widthA = params.targetWidthA;
   let eStop = max(5.0, params.esEv);
   let pot = params.potentialCode;
+  let edEv = max(5.0, params.edEv);
+  let ebEv = max(0.0, params.ebEv);
 
   var energy = params.energyEv;
   var pos = vec3<f32>(0.0, 0.0, 0.0);
@@ -259,9 +281,18 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
   let monoL = pow(N, -1.0 / 3.0);
   let pMaxMono = 1.0 / sqrt(3.14159265 * N * monoL);
   let massRatio = m1 / m2;
+  let kL = (0.1337 * pow(max(1.0, z2), 2.0 / 3.0)) / sqrt(max(1.0, m2));
+
+  let recordTrack = ionIdx < 64u;
+  var vCount = 0u;
+  if (recordTrack) {
+    trackVerts[ionIdx * 24u] = vec4<f32>(pos.x, pos.y, pos.z, energy);
+    vCount = 1u;
+  }
 
   var steps = 0u;
   var fate = 0u;
+  var bindSumEv = 0.0;
 
   while (steps < 12000u && energy > eStop) {
     steps = steps + 1u;
@@ -293,8 +324,13 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let se = lookupSeEvPerA(energy);
     let deElec = min(energy - 0.5 * eStop, max(0.0, se * jumpA));
     energy = max(0.0, energy - deElec);
+    let midX = 0.5 * (pos.x + nextPos.x);
+    addHistStochastic(100u, midX, deElec, &rngState);
+
     pos = nextPos;
     if (energy <= eStop) {
+      addHistStochastic(200u, pos.x, energy, &rngState);
+      energy = 0.0;
       break;
     }
 
@@ -308,6 +344,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let recoilE = min(energy, gamma * energy * sinSqHalf);
     energy = max(0.0, energy - recoilE);
 
+    // Quick Kinchin-Pease energy partition into Ionization / Phonon / Vacancies
+    if (recoilE >= edEv) {
+      let eRecInit = max(0.0, recoilE - ebEv);
+      let epsL = (0.01151 * eRecInit) / pow(max(1.0, z2), 7.0 / 3.0);
+      let gEps = epsL + 0.40244 * pow(epsL, 0.75) + 3.4008 * pow(epsL, 1.0 / 6.0);
+      let edam = eRecInit / (1.0 + kL * gEps);
+      let recIoniz = max(0.0, eRecInit - edam);
+      var vac = 1.0;
+      if (edam >= 2.5 * edEv) {
+        vac = (0.4 * edam) / edEv;
+      }
+      let recBind = vac * ebEv;
+      let recPhon = max(0.0, recoilE - recIoniz - recBind);
+      bindSumEv = bindSumEv + recBind;
+      addHistStochastic(100u, pos.x, recIoniz, &rngState);
+      addHistStochastic(200u, pos.x, recPhon, &rngState);
+      addHistStochastic(300u, pos.x, vac * 10.0, &rngState);
+    } else {
+      addHistStochastic(200u, pos.x, recoilE, &rngState);
+    }
+
     let sinTheta = 2.0 * sinHalf * cosHalf;
     let cosTheta = 1.0 - 2.0 * sinSqHalf;
     let denomIon = sqrt(max(1e-12, sinTheta * sinTheta + (cosTheta + massRatio) * (cosTheta + massRatio)));
@@ -316,21 +373,39 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let phi = 6.2831853 * pcg32(&rngState);
     dir = rotateDir3D(dir, cosPsiIon, sinPsiIon, phi);
+
+    if (recordTrack && vCount < 23u && (steps % 4u == 0u || recoilE >= 50.0)) {
+      trackVerts[ionIdx * 24u + vCount] = vec4<f32>(pos.x, pos.y, pos.z, energy);
+      vCount = vCount + 1u;
+    }
+  }
+
+  if (fate == 0u && energy > 0.0) {
+    addHistStochastic(200u, pos.x, energy, &rngState);
+  }
+
+  if (recordTrack && vCount < 24u) {
+    trackVerts[ionIdx * 24u + vCount] = vec4<f32>(pos.x, pos.y, pos.z, 0.0);
+    vCount = vCount + 1u;
   }
 
   atomicAdd(&globalCounters[fate], 1u);
   atomicAdd(&globalCounters[3], 1u);
+  let bRound = u32(max(0.0, bindSumEv + pcg32(&rngState)));
+  if (bRound > 0u) {
+    atomicAdd(&globalCounters[4], bRound);
+  }
 
   if (fate == 0u) {
     let binIdx = u32(clamp(pos.x / params.binWidthA, 0.0, 99.0));
-    atomicAdd(&histBins[binIdx], 1u);
+    atomicAdd(&histAll[binIdx], 1u);
   }
 
   if (ionIdx < 4096u) {
     stoppedIons[ionIdx].x = pos.x;
     stoppedIons[ionIdx].y = pos.y;
     stoppedIons[ionIdx].z = pos.z;
-    stoppedIons[ionIdx].fate = fate;
+    stoppedIons[ionIdx].fate = (vCount << 4u) | (fate & 15u);
   }
 }
 `;
@@ -385,7 +460,6 @@ export class WebGpuTrimRunner {
       throw new Error('WebGPU not initialized or supported in this environment');
     }
 
-    // 1 dispatch supports up to 65,535 * 64 = 4.19M ions; allow up to 1,000,000 ions per batch
     const nIons = Math.max(1, Math.min(1_000_000, Math.round(count)));
 
     // 1. Uniform Buffer: 64 bytes
@@ -403,8 +477,9 @@ export class WebGpuTrimRunner {
     uniformArray[10] = params.binWidthA;
     const u32View = new Uint32Array(uniformArray.buffer);
     u32View[11] = nIons;
-    u32View[12] = (Date.now() & 0xffffffff) >>> 0;
+    u32View[12] = ((Date.now() ^ Math.floor(Math.random() * 1e9)) & 0xffffffff) >>> 0;
     u32View[13] = params.potentialCode ?? 0;
+    uniformArray[14] = 2.0;
 
     const uniformBuffer = this.device.createBuffer({
       size: uniformArray.byteLength,
@@ -412,9 +487,9 @@ export class WebGpuTrimRunner {
     });
     this.device.queue.writeBuffer(uniformBuffer, 0, uniformArray);
 
-    // 2. Histogram storage buffer: 100 * 4 = 400 bytes
+    // 2. Combined histograms buffer: 400 * 4 = 1600 bytes
     const histBuffer = this.device.createBuffer({
-      size: 100 * 4,
+      size: 400 * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -426,9 +501,9 @@ export class WebGpuTrimRunner {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
     });
 
-    // 4. Global counters buffer: 4 * 4 = 16 bytes
+    // 4. Global counters buffer: 8 * 4 = 32 bytes
     const countersBuffer = this.device.createBuffer({
-      size: 16,
+      size: 32,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
 
@@ -443,9 +518,16 @@ export class WebGpuTrimRunner {
     });
     this.device.queue.writeBuffer(seBuffer, 0, seArr);
 
+    // 6. GPU Sampled 3D Track buffer: 64 tracks * 24 vec4<f32> = 24,576 bytes
+    const trackBufferSize = GPU_TRACK_COUNT * GPU_TRACK_MAX_VERTS * 16;
+    const trackBuffer = this.device.createBuffer({
+      size: trackBufferSize,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+
     // Staging buffers for readback
     const stageHist = this.device.createBuffer({
-      size: 400,
+      size: 400 * 4,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const stageStopped = this.device.createBuffer({
@@ -453,7 +535,11 @@ export class WebGpuTrimRunner {
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     const stageCounters = this.device.createBuffer({
-      size: 16,
+      size: 32,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+    const stageTracks = this.device.createBuffer({
+      size: trackBufferSize,
       usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
 
@@ -465,6 +551,7 @@ export class WebGpuTrimRunner {
         { binding: 2, resource: { buffer: stoppedBuffer } },
         { binding: 3, resource: { buffer: countersBuffer } },
         { binding: 4, resource: { buffer: seBuffer } },
+        { binding: 5, resource: { buffer: trackBuffer } },
       ],
     });
 
@@ -475,9 +562,10 @@ export class WebGpuTrimRunner {
     pass.dispatchWorkgroups(Math.ceil(nIons / 64));
     pass.end();
 
-    commandEncoder.copyBufferToBuffer(histBuffer, 0, stageHist, 0, 400);
+    commandEncoder.copyBufferToBuffer(histBuffer, 0, stageHist, 0, 400 * 4);
     commandEncoder.copyBufferToBuffer(stoppedBuffer, 0, stageStopped, 0, stoppedBufferSize);
-    commandEncoder.copyBufferToBuffer(countersBuffer, 0, stageCounters, 0, 16);
+    commandEncoder.copyBufferToBuffer(countersBuffer, 0, stageCounters, 0, 32);
+    commandEncoder.copyBufferToBuffer(trackBuffer, 0, stageTracks, 0, trackBufferSize);
 
     this.device.queue.submit([commandEncoder.finish()]);
 
@@ -485,49 +573,108 @@ export class WebGpuTrimRunner {
       stageHist.mapAsync(GPUMapMode.READ),
       stageStopped.mapAsync(GPUMapMode.READ),
       stageCounters.mapAsync(GPUMapMode.READ),
+      stageTracks.mapAsync(GPUMapMode.READ),
     ]);
 
-    const histData = new Uint32Array(stageHist.getMappedRange());
-    const rangeHist = Array.from(histData);
+    const histAll = new Uint32Array(stageHist.getMappedRange());
+    const rangeHist = Array.from(histAll.subarray(0, 100));
+    const ionizationHist = Array.from(histAll.subarray(100, 200));
+    const phononHist = Array.from(histAll.subarray(200, 300));
+    const vacancyHist = Array.from(histAll.subarray(300, 400), (v) => v / 10.0);
+
+    let totalIonizEv = 0;
+    let totalPhononEv = 0;
+    let totalVacancies = 0;
+    for (let b = 0; b < 100; b++) {
+      totalIonizEv += ionizationHist[b];
+      totalPhononEv += phononHist[b];
+      totalVacancies += vacancyHist[b];
+    }
 
     const countersData = new Uint32Array(stageCounters.getMappedRange());
     const stoppedCount = countersData[0];
     const backscatterCount = countersData[1];
     const transmitCount = countersData[2];
+    const totalBindingEv = countersData[4];
 
-    const stoppedFloats = new Float32Array(stageStopped.getMappedRange());
+    const stoppedView = new DataView(stageStopped.getMappedRange());
     const stoppedX: number[] = [];
     const stoppedY: number[] = [];
     const stoppedZ: number[] = [];
+    const stoppedFate: number[] = [];
+    const trackVertCounts: number[] = [];
 
     for (let i = 0; i < maxIonsToRecord; i++) {
-      const offset = i * 4;
-      stoppedX.push(stoppedFloats[offset]);
-      stoppedY.push(stoppedFloats[offset + 1]);
-      stoppedZ.push(stoppedFloats[offset + 2]);
+      const byteOff = i * 16;
+      stoppedX.push(stoppedView.getFloat32(byteOff, true));
+      stoppedY.push(stoppedView.getFloat32(byteOff + 4, true));
+      stoppedZ.push(stoppedView.getFloat32(byteOff + 8, true));
+      const packed = stoppedView.getUint32(byteOff + 12, true);
+      stoppedFate.push(packed & 15);
+      if (i < GPU_TRACK_COUNT) {
+        trackVertCounts.push((packed >>> 4) & 0x3f);
+      }
+    }
+
+    const trackFloats = new Float32Array(stageTracks.getMappedRange());
+    const sampleTracks: TrimTrajectory[] = [];
+    const nTracks = Math.min(GPU_TRACK_COUNT, nIons);
+    for (let t = 0; t < nTracks; t++) {
+      const vc = Math.min(GPU_TRACK_MAX_VERTS, trackVertCounts[t] || 0);
+      if (vc < 2) continue;
+      const pts: TrimPoint3D[] = [];
+      for (let v = 0; v < vc; v++) {
+        const base = (t * GPU_TRACK_MAX_VERTS + v) * 4;
+        pts.push({
+          xA: trackFloats[base],
+          yA: trackFloats[base + 1],
+          zA: trackFloats[base + 2],
+          energyEv: trackFloats[base + 3],
+        });
+      }
+      const fCode = stoppedFate[t] ?? 0;
+      sampleTracks.push({
+        ionNumber: t + 1,
+        z1: params.z1,
+        fate: fCode === 1 ? 'backscattered' : fCode === 2 ? 'transmitted' : 'stopped',
+        points: pts,
+        recoils: [],
+      });
     }
 
     stageHist.unmap();
     stageStopped.unmap();
     stageCounters.unmap();
+    stageTracks.unmap();
 
     uniformBuffer.destroy();
     histBuffer.destroy();
     stoppedBuffer.destroy();
     countersBuffer.destroy();
     seBuffer.destroy();
+    trackBuffer.destroy();
     stageHist.destroy();
     stageStopped.destroy();
     stageCounters.destroy();
+    stageTracks.destroy();
 
     return {
       rangeHist,
+      ionizationHist,
+      phononHist,
+      vacancyHist,
       stoppedX,
       stoppedY,
       stoppedZ,
+      stoppedFate,
+      sampleTracks,
       stoppedCount,
       backscatterCount,
       transmitCount,
+      totalIonizEv,
+      totalPhononEv,
+      totalBindingEv,
+      totalVacancies,
     };
   }
 }
