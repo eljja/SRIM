@@ -1651,12 +1651,12 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
     return m > 0 ? m * 1.08 : 1.0;
   }, [series]);
 
-  // 1.5x height (290 -> 435px) and dynamic full-container width with minimal side margins
+  // 1.5x height (290 -> 435px), full-container width, 1.5x fonts, and symmetric X/Y grid
   const height = 435;
-  const padL = 56;
-  const padR = 12;
-  const padT = 18;
-  const padB = 34;
+  const padL = 76;
+  const padR = 16;
+  const padT = 22;
+  const padB = 48;
   const plotW = Math.max(100, width - padL - padR);
   const plotH = height - padT - padB;
   const nBins = Math.max(1, depthsA.length);
@@ -1669,14 +1669,14 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
           <p className="text-[11px] text-slate-400">{subtitle}</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
-          <div className="flex items-center gap-3 text-xs mr-2">
+          <div className="flex items-center gap-3 text-sm mr-2">
             {series.map((s) => (
               <span key={s.name} className="flex items-center gap-1.5">
                 <span
-                  className="w-2.5 h-2.5 rounded-full inline-block"
+                  className="w-3 h-3 rounded-full inline-block"
                   style={{ backgroundColor: s.color }}
                 />
-                <span className="text-slate-200 font-medium">{s.name}</span>
+                <span className="text-slate-200 font-semibold">{s.name}</span>
               </span>
             ))}
           </div>
@@ -1724,11 +1724,11 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
                   strokeDasharray="3 3"
                 />
                 <text
-                  x={padL - 6}
-                  y={y + 3}
+                  x={padL - 8}
+                  y={y + 5}
                   textAnchor="end"
                   fill="#94a3b8"
-                  fontSize="10"
+                  fontSize="15"
                   fontFamily="monospace"
                 >
                   {val >= 1000 || (val > 0 && val < 0.01)
@@ -1739,7 +1739,7 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
             );
           })}
 
-          {/* X-Axis Ticks */}
+          {/* Vertical X-Grid Lines & X-Axis Ticks */}
           {[0, 0.25, 0.5, 0.75, 1.0].map((f, idx) => {
             const bIdx = Math.min(
               nBins - 1,
@@ -1748,26 +1748,35 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
             const x = padL + f * plotW;
             const dVal = depthsA[bIdx] ?? 0;
             return (
-              <text
-                key={idx}
-                x={x}
-                y={height - 16}
-                textAnchor="middle"
-                fill="#94a3b8"
-                fontSize="10"
-                fontFamily="monospace"
-              >
-                {dVal.toFixed(1)}
-              </text>
+              <g key={idx}>
+                <line
+                  x1={x}
+                  y1={padT}
+                  x2={x}
+                  y2={padT + plotH}
+                  stroke="#1e293b"
+                  strokeDasharray="3 3"
+                />
+                <text
+                  x={x}
+                  y={padT + plotH + 20}
+                  textAnchor="middle"
+                  fill="#94a3b8"
+                  fontSize="15"
+                  fontFamily="monospace"
+                >
+                  {dVal.toFixed(1)}
+                </text>
+              </g>
             );
           })}
 
           <text
             x={padL + plotW * 0.5}
-            y={height - 2}
+            y={height - 4}
             textAnchor="middle"
             fill="#cbd5e1"
-            fontSize="11"
+            fontSize="16"
             fontWeight="bold"
           >
             {xLabel}
@@ -1835,7 +1844,7 @@ const DepthHistogramChart: React.FC<DepthHistogramChartProps> = ({
         </svg>
 
         {hoverIdx !== null && depthsA[hoverIdx] !== undefined && (
-          <div className="absolute top-3 right-4 px-3 py-1.5 rounded-lg bg-slate-900/95 border border-slate-700 text-[11px] font-mono text-slate-200 shadow-lg pointer-events-none">
+          <div className="absolute top-3 right-4 px-3.5 py-2 rounded-lg bg-slate-900/95 border border-slate-700 text-sm font-mono text-slate-200 shadow-lg pointer-events-none">
             <div className="text-slate-400">
               X = {depthsA[hoverIdx].toFixed(2)} ({yUnit})
             </div>

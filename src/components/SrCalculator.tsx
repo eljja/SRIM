@@ -680,12 +680,12 @@ const SrCurveChart: React.FC<SrCurveChartProps> = ({
 }) => {
   if (rows.length === 0) return null;
 
-  const width = 720;
-  const height = 270;
-  const padL = 66;
-  const padR = 24;
-  const padT = 20;
-  const padB = 36;
+  const width = 880;
+  const height = 405; // 1.5x of previous 270px
+  const padL = 80;
+  const padR = 16;
+  const padT = 22;
+  const padB = 48;
   const plotW = width - padL - padR;
   const plotH = height - padT - padB;
 
@@ -765,21 +765,21 @@ const SrCurveChart: React.FC<SrCurveChartProps> = ({
 
   return (
     <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-3 space-y-2">
-      <div className="flex flex-wrap items-center justify-end gap-4 text-xs">
+      <div className="flex flex-wrap items-center justify-end gap-4 text-sm">
         {series.map((s) => (
           <span key={s.name} className="flex items-center gap-1.5">
             <span
-              className="w-2.5 h-2.5 rounded-full inline-block"
+              className="w-3 h-3 rounded-full inline-block"
               style={{ backgroundColor: s.color }}
             />
-            <span className="text-slate-200 font-medium">{s.name}</span>
+            <span className="text-slate-200 font-semibold">{s.name}</span>
           </span>
         ))}
       </div>
 
       <svg
         viewBox={`0 0 ${width} ${height}`}
-        className="w-full h-[260px] overflow-visible"
+        className="w-full h-[405px] block overflow-visible"
       >
         {[0, 0.25, 0.5, 0.75, 1.0].map((f, idx) => {
           const y = padT + plotH * (1 - f);
@@ -801,11 +801,11 @@ const SrCurveChart: React.FC<SrCurveChartProps> = ({
                 strokeDasharray="3 3"
               />
               <text
-                x={padL - 6}
-                y={y + 3}
+                x={padL - 8}
+                y={y + 5}
                 textAnchor="end"
                 fill="#94a3b8"
-                fontSize="10"
+                fontSize="15"
                 fontFamily="monospace"
               >
                 {v >= 1000 || (v > 0 && v < 0.01)
@@ -825,28 +825,37 @@ const SrCurveChart: React.FC<SrCurveChartProps> = ({
               )
             : eMin + f * (eMax - eMin);
           return (
-            <text
-              key={idx}
-              x={x}
-              y={height - 16}
-              textAnchor="middle"
-              fill="#94a3b8"
-              fontSize="10"
-              fontFamily="monospace"
-            >
-              {eVal >= 1000
-                ? `${(eVal / 1000).toFixed(1)}M`
-                : `${eVal.toFixed(1)}k`}
-            </text>
+            <g key={idx}>
+              <line
+                x1={x}
+                y1={padT}
+                x2={x}
+                y2={padT + plotH}
+                stroke="#1e293b"
+                strokeDasharray="3 3"
+              />
+              <text
+                x={x}
+                y={padT + plotH + 20}
+                textAnchor="middle"
+                fill="#94a3b8"
+                fontSize="15"
+                fontFamily="monospace"
+              >
+                {eVal >= 1000
+                  ? `${(eVal / 1000).toFixed(1)}M`
+                  : `${eVal.toFixed(1)}k`}
+              </text>
+            </g>
           );
         })}
 
         <text
           x={padL + plotW * 0.5}
-          y={height - 2}
+          y={height - 4}
           textAnchor="middle"
           fill="#cbd5e1"
-          fontSize="11"
+          fontSize="16"
           fontWeight="bold"
         >
           Ion Energy (keV / MeV)

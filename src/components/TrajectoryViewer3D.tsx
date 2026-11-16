@@ -224,12 +224,12 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
       if (zoom < 12) {
         const [lx, ly] = projectPoint(0.5 * (x0 + x1), -s, s);
         ctx.fillStyle = layerPalette[idx % layerPalette.length];
-        ctx.font = '600 11px Inter, system-ui, sans-serif';
+        ctx.font = '600 15px Inter, system-ui, sans-serif';
         ctx.fillStyle = '#bae6fd';
         ctx.fillText(
           `L${idx + 1}: ${layer.name} (${x0}–${x1} Å)`,
-          lx - 35,
-          ly - 8
+          lx - 45,
+          ly - 10
         );
       }
     });
@@ -356,12 +356,12 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
             ctx.stroke();
 
             if (detailedIonLabels) {
-              ctx.font = '600 10px monospace';
+              ctx.font = '600 13px monospace';
               ctx.fillStyle = '#a7f3d0';
               ctx.fillText(
                 `#${traj.ionNumber} (${last.xA.toFixed(1)}, ${last.yA.toFixed(1)}, ${last.zA.toFixed(1)} Å)`,
                 ex + 10,
-                ey + 3
+                ey + 4
               );
             }
           }
@@ -392,12 +392,12 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
           ctx.lineTo(ex, ey + 7);
           ctx.stroke();
           if (detailedIonLabels) {
-            ctx.font = '600 10px monospace';
+            ctx.font = '600 13px monospace';
             ctx.fillStyle = '#a7f3d0';
             ctx.fillText(
               `#${s.ionNumber} (${s.xA.toFixed(1)}, ${s.yA.toFixed(1)}, ${s.zA.toFixed(1)} Å)`,
               ex + 9,
-              ey + 3
+              ey + 4
             );
           }
         }
@@ -411,35 +411,35 @@ export const TrajectoryViewer3D: React.FC<TrajectoryViewer3DProps> = ({
     const bar = chooseScaleBar(pxPerA);
 
     const sbX = 16;
-    const sbY = 24;
+    const sbY = 26;
     ctx.save();
-    ctx.fillStyle = 'rgba(2, 6, 23, 0.82)';
+    ctx.fillStyle = 'rgba(2, 6, 23, 0.85)';
     ctx.strokeStyle = 'rgba(56, 189, 248, 0.45)';
     ctx.lineWidth = 1;
-    const boxW = Math.max(bar.px + 28, 128);
+    const boxW = Math.max(bar.px + 34, 158);
     ctx.beginPath();
-    ctx.roundRect(sbX - 8, sbY - 14, boxW, 40, 8);
+    ctx.roundRect(sbX - 8, sbY - 16, boxW, 46, 8);
     ctx.fill();
     ctx.stroke();
 
     // Scale bar bracket line
     ctx.strokeStyle = '#38bdf8';
-    ctx.lineWidth = 2.2;
+    ctx.lineWidth = 2.4;
     ctx.beginPath();
-    ctx.moveTo(sbX, sbY + 10);
-    ctx.lineTo(sbX, sbY + 16);
-    ctx.lineTo(sbX + bar.px, sbY + 16);
-    ctx.lineTo(sbX + bar.px, sbY + 10);
+    ctx.moveTo(sbX, sbY + 14);
+    ctx.lineTo(sbX, sbY + 21);
+    ctx.lineTo(sbX + bar.px, sbY + 21);
+    ctx.lineTo(sbX + bar.px, sbY + 14);
     ctx.stroke();
 
-    ctx.font = 'bold 11px monospace';
+    ctx.font = 'bold 15px monospace';
     ctx.fillStyle = '#e0f2fe';
-    ctx.fillText(bar.label, sbX, sbY + 2);
+    ctx.fillText(bar.label, sbX, sbY + 3);
 
-    ctx.font = '10px monospace';
+    ctx.font = '13px monospace';
     ctx.fillStyle = '#94a3b8';
     const zoomLabel = zoom >= 100 ? `${zoom.toFixed(0)}×` : `${zoom.toFixed(zoom >= 10 ? 1 : 2)}×`;
-    ctx.fillText(`Zoom ${zoomLabel}`, sbX + bar.px + 8 > sbX + boxW - 56 ? sbX + 54 : sbX + bar.px + 8, sbY + 2);
+    ctx.fillText(`Zoom ${zoomLabel}`, sbX + bar.px + 10 > sbX + boxW - 72 ? sbX + 68 : sbX + bar.px + 10, sbY + 3);
     ctx.restore();
 
     ctx.restore();

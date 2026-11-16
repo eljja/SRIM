@@ -30,7 +30,18 @@ import {
   generateCsvData,
   downloadFile,
 } from '../physics/exportUtils';
-import type { TrimSetupConfig, TrimSnapshot } from '../physics/types';
+import {
+  DEFAULT_ADVANCED_PHYSICS,
+  inferCrystalPresetForLayer,
+} from '../physics/advancedPhysics';
+import type {
+  CrystalLatticeType,
+  CrystalOrientation,
+  ScreeningPotentialType,
+  TrimAdvancedPhysicsConfig,
+  TrimSetupConfig,
+  TrimSnapshot,
+} from '../physics/types';
 
 interface ImplantAnalyticsProps {
   trimConfig: TrimSetupConfig;
@@ -76,6 +87,24 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
   const [mcRunning, setMcRunning] = useState<boolean>(false);
   const mcWorkerRef = useRef<Worker | null>(null);
   const mcCancelRef = useRef<boolean>(false);
+
+  // Post-SRIM-2003 Crystal Orientation, Tilt/Twist & Advanced Physics (synced with active trimConfig by default)
+  const [advPhysics, setAdvPhysics] = useState<TrimAdvancedPhysicsConfig>(() => {
+    if (trimConfig.advancedPhysics) return trimConfig.advancedPhysics;
+    const l0 = trimConfig.layers[0];
+    const inf = inferCrystalPresetForLayer(l0?.name || 'c-Si', l0?.elements[0]?.z || 14);
+    return {
+      ...DEFAULT_ADVANCED_PHYSICS,
+      crystalLattice: inf.lattice,
+      latticeConstantA: inf.aA,
+      latticeCConstantA: inf.cA,
+      debyeTempK: inf.debyeTempK,
+    };
+  });
+
+  const updateAdvPhysics = (patch: Partial<TrimAdvancedPhysicsConfig>) => {
+    setAdvPhysics((prev) => ({ ...prev, ...patch }));
+  };
 
   useEffect(() => {
     return () => {
@@ -256,14 +285,21 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
     stopTrimBenchmark();
     mcCancelRef.current = false;
 
+    // Expand depth domain cleanly when single-crystal channeling is ON so deep axial tails remain unclipped
+    const depthMult = advPhysics.crystalMode ? 12.0 : 4.8;
+    const minCrystalDepth = advPhysics.crystalMode ? 4000 : 400;
     const estDepthA = Math.max(
-      400,
+      minCrystalDepth,
       Math.ceil(
         (currentPointMetrics.pral.projectedRangeA +
-          4.8 * currentPointMetrics.pral.longitudinalStragglingA) /
+          depthMult * currentPointMetrics.pral.longitudinalStragglingA) /
           100
       ) * 100
     );
+    const activeAdv: TrimAdvancedPhysicsConfig = {
+      ...advPhysics,
+      doseCm2,
+    };
     const cfg: TrimSetupConfig = {
       title: `${selectedIonMeta.symbol} (${energyKeV} keV) into ${selectedTargetMat.name}`,
       ion: {
@@ -294,9 +330,10 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
           elements: selectedTargetMat.elements.map((e) => ({ ...e })),
         },
       ],
+      advancedPhysics: activeAdv,
     };
 
-    const runKey = `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}`;
+    const runKey = `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}-${advPhysics.crystalMode}-${advPhysics.crystalOrientation}-${advPhysics.crystalTiltDeg}-${advPhysics.crystalTwistDeg}-${advPhysics.screeningPotential}-${advPhysics.localElectronicStopping}-${advPhysics.arcDpaRecombination}-${advPhysics.dynamicComposition}-${doseCm2}`;
     const chunkSize = safeCount >= 100_000 ? 10_000 : safeCount >= 10_000 ? 2_500 : 1_000;
 
     if (typeof Worker !== 'undefined') {
@@ -345,7 +382,8 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
 
   const currentRunMatches =
     mcSnapshot !== null &&
-    mcRunKey === `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}`;
+    mcRunKey ===
+      `${selectedIonZ}-${energyKeV}-${selectedTargetMat.id}-${advPhysics.crystalMode}-${advPhysics.crystalOrientation}-${advPhysics.crystalTiltDeg}-${advPhysics.crystalTwistDeg}-${advPhysics.screeningPotential}-${advPhysics.localElectronicStopping}-${advPhysics.arcDpaRecombination}-${advPhysics.dynamicComposition}-${doseCm2}`;
 
   /** Shared MC ion-count selector (up to 1,000,000) & Run/Stop control used across Tab 2 & Tab 3 */
   const mcRunnerControls = (
@@ -672,6 +710,212 @@ export const ImplantAnalytics: React.FC<ImplantAnalyticsProps> = ({
           </button>
         ))}
       </div>
+
+      {/* Shared Post-SRIM Crystal Orientation, Tilt/Twist & Advanced Physics Bar (Tab 2 & Tab 3) */}
+      {activeTab !== 'benchmarks' && (
+        <div className="bg-slate-900/80 border border-indigo-500/30 rounded-2xl px-4 py-3 flex flex-wrap items-center justify-between gap-3 text-xs">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-300">
+              Post-SRIM Physics:
+            </span>
+
+            <button
+              type="button"
+              onClick={() => {
+                const nextCrystal = !advPhysics.crystalMode;
+                if (nextCrystal) {
+                  const inf = inferCrystalPresetForLayer(
+                    selectedTargetMat.name,
+                    selectedTargetMat.elements[0]?.z || 14
+                  );
+                  updateAdvPhysics({
+                    crystalMode: true,
+                    crystalLattice: inf.lattice,
+                    latticeConstantA: inf.aA,
+                    latticeCConstantA: inf.cA,
+                    debyeTempK: inf.debyeTempK,
+                  });
+                } else {
+                  updateAdvPhysics({ crystalMode: false });
+                }
+              }}
+              className={`px-2.5 py-1 rounded-lg font-semibold border transition-colors ${
+                advPhysics.crystalMode
+                  ? 'bg-indigo-600 text-white border-indigo-400'
+                  : 'bg-slate-950 text-slate-300 border-slate-700 hover:border-slate-500'
+              }`}
+            >
+              {advPhysics.crystalMode
+                ? 'Crystal Lattice (Channeling ON)'
+                : 'Amorphous (SRIM-2003)'}
+            </button>
+
+            {advPhysics.crystalMode && (
+              <>
+                <select
+                  value={advPhysics.crystalLattice}
+                  onChange={(e) =>
+                    updateAdvPhysics({
+                      crystalLattice: e.target.value as CrystalLatticeType,
+                    })
+                  }
+                  className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] text-white"
+                  title="Crystal Lattice Structure"
+                >
+                  <option value="diamond">Diamond (Si/Ge/C)</option>
+                  <option value="zincblende">Zincblende (GaAs/InP)</option>
+                  <option value="wurtzite">Wurtzite (4H-SiC/GaN)</option>
+                  <option value="fcc">FCC</option>
+                  <option value="bcc">BCC</option>
+                </select>
+
+                <div className="flex items-center gap-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                  <span className="text-slate-400">Axis:</span>
+                  {(['<100>', '<110>', '<111>', '<112>'] as CrystalOrientation[]).map(
+                    (ori) => (
+                      <button
+                        key={ori}
+                        type="button"
+                        onClick={() => updateAdvPhysics({ crystalOrientation: ori })}
+                        className={`px-1.5 py-0.5 rounded font-mono text-[11px] ${
+                          advPhysics.crystalOrientation === ori
+                            ? 'bg-cyan-600 text-white font-bold'
+                            : 'text-slate-400 hover:text-white'
+                        }`}
+                      >
+                        {ori}
+                      </button>
+                    )
+                  )}
+                </div>
+
+                <label className="flex items-center gap-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                  <span className="text-slate-400">Tilt:</span>
+                  <input
+                    type="number"
+                    step={0.5}
+                    min={-25}
+                    max={25}
+                    value={advPhysics.crystalTiltDeg}
+                    onChange={(e) =>
+                      updateAdvPhysics({
+                        crystalTiltDeg: Math.max(
+                          -25,
+                          Math.min(25, Number(e.target.value) || 0)
+                        ),
+                      })
+                    }
+                    className="w-12 bg-transparent font-mono text-cyan-300 font-bold focus:outline-none"
+                  />
+                  <span className="text-slate-500">°</span>
+                </label>
+
+                <label className="flex items-center gap-1 bg-slate-950 border border-slate-700 rounded-lg px-2 py-1">
+                  <span className="text-slate-400">Twist:</span>
+                  <input
+                    type="number"
+                    step={1}
+                    min={0}
+                    max={360}
+                    value={advPhysics.crystalTwistDeg}
+                    onChange={(e) =>
+                      updateAdvPhysics({
+                        crystalTwistDeg: Math.max(
+                          0,
+                          Math.min(360, Number(e.target.value) || 0)
+                        ),
+                      })
+                    }
+                    className="w-12 bg-transparent font-mono text-emerald-300 font-bold focus:outline-none"
+                  />
+                  <span className="text-slate-500">°</span>
+                </label>
+              </>
+            )}
+
+            <select
+              value={advPhysics.screeningPotential}
+              onChange={(e) =>
+                updateAdvPhysics({
+                  screeningPotential: e.target.value as ScreeningPotentialType,
+                })
+              }
+              className="bg-slate-950 border border-slate-700 rounded-lg px-2 py-1 text-[11px] font-mono text-slate-200"
+            >
+              <option value="zbl">Potential: ZBL</option>
+              <option value="krc">Potential: Kr-C</option>
+              <option value="moliere">Potential: Molière</option>
+            </select>
+
+            <button
+              type="button"
+              onClick={() =>
+                updateAdvPhysics({
+                  localElectronicStopping: !advPhysics.localElectronicStopping,
+                })
+              }
+              className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+                advPhysics.localElectronicStopping
+                  ? 'bg-cyan-950/70 border-cyan-500/50 text-cyan-200'
+                  : 'bg-slate-950 border-slate-800 text-slate-500'
+              }`}
+            >
+              Oen–Robinson Sₑ(b)
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                updateAdvPhysics({
+                  arcDpaRecombination: !advPhysics.arcDpaRecombination,
+                })
+              }
+              className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+                advPhysics.arcDpaRecombination
+                  ? 'bg-emerald-950/70 border-emerald-500/50 text-emerald-200'
+                  : 'bg-slate-950 border-slate-800 text-slate-500'
+              }`}
+            >
+              ARC-dpa
+            </button>
+
+            <button
+              type="button"
+              onClick={() =>
+                updateAdvPhysics({
+                  dynamicComposition: !advPhysics.dynamicComposition,
+                })
+              }
+              className={`px-2 py-1 rounded-lg border text-[11px] font-semibold ${
+                advPhysics.dynamicComposition
+                  ? 'bg-amber-950/70 border-amber-500/50 text-amber-200'
+                  : 'bg-slate-950 border-slate-800 text-slate-500'
+              }`}
+            >
+              TRIDYN Dynamic
+            </button>
+          </div>
+
+          {currentRunMatches && mcSnapshot?.advancedDiagnostics && (
+            <div className="flex flex-wrap items-center gap-3 font-mono text-xs text-slate-300">
+              {advPhysics.crystalMode && (
+                <span>
+                  Channeled:{' '}
+                  <strong className="text-cyan-300">
+                    {mcSnapshot.advancedDiagnostics.channeledFractionPct.toFixed(1)}%
+                  </strong>
+                </span>
+              )}
+              <span>
+                Vac/Ion:{' '}
+                <strong className="text-emerald-300">
+                  {mcSnapshot.vacanciesPerIon.toFixed(1)}
+                </strong>
+              </span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* === TAB 1: THIN FILM BENCHMARKS === */}
       {activeTab === 'benchmarks' && (
@@ -1334,13 +1578,29 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
   series,
   highlightPoint,
 }) => {
-  const width = 640;
-  const height = 280;
-  const padL = 68;
-  const padR = 20;
-  const padT = 20;
-  const padB = 38;
-  const plotW = width - padL - padR;
+  const boxRef = useRef<HTMLDivElement | null>(null);
+  const [width, setWidth] = useState<number>(760);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver((entries) => {
+      for (const entry of entries) {
+        const w = Math.floor(entry.contentRect.width);
+        if (w > 240) setWidth(w);
+      }
+    });
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // 1.5x vertical height (280 -> 420px), full-width plot box fill, 1.5x fonts
+  const height = 420;
+  const padL = 82;
+  const padR = 16;
+  const padT = 22;
+  const padB = 48;
+  const plotW = Math.max(100, width - padL - padR);
   const plotH = height - padT - padB;
 
   const minX = xValues[0] ?? 0;
@@ -1436,20 +1696,23 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
       </div>
 
       {/* Legend */}
-      <div className="flex flex-wrap gap-3 text-[11px]">
+      <div className="flex flex-wrap gap-3 text-sm">
         {series.map((s) => (
           <span key={s.name} className="flex items-center gap-1.5">
             <span
-              className="w-2.5 h-2.5 rounded-full inline-block"
+              className="w-3 h-3 rounded-full inline-block"
               style={{ backgroundColor: s.color }}
             />
-            <span className="text-slate-200 font-medium">{s.name}</span>
+            <span className="text-slate-200 font-semibold">{s.name}</span>
           </span>
         ))}
       </div>
 
-      <div className="bg-slate-950/90 border border-slate-800 rounded-xl p-2">
-        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-[270px]">
+      <div
+        ref={boxRef}
+        className="bg-slate-950/90 border border-slate-800 rounded-xl p-1"
+      >
+        <svg viewBox={`0 0 ${width} ${height}`} className="w-full h-[420px] block overflow-visible">
           {[0, 0.25, 0.5, 0.75, 1.0].map((f, idx) => {
             const yPos = padT + plotH * (1 - f);
             const rawLabelVal = logY
@@ -1466,11 +1729,11 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
                   strokeDasharray="3 3"
                 />
                 <text
-                  x={padL - 6}
-                  y={yPos + 3}
+                  x={padL - 8}
+                  y={yPos + 5}
                   textAnchor="end"
                   fill="#94a3b8"
-                  fontSize="10"
+                  fontSize="15"
                   fontFamily="monospace"
                 >
                   {logY || rawLabelVal >= 1000 || (rawLabelVal > 0 && rawLabelVal < 0.01)
@@ -1485,26 +1748,35 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
             const xVal = minX + (maxX - minX) * f;
             const xPos = padL + plotW * f;
             return (
-              <text
-                key={idx}
-                x={xPos}
-                y={height - 16}
-                textAnchor="middle"
-                fill="#94a3b8"
-                fontSize="10"
-                fontFamily="monospace"
-              >
-                {xVal.toFixed(1)}
-              </text>
+              <g key={idx}>
+                <line
+                  x1={xPos}
+                  y1={padT}
+                  x2={xPos}
+                  y2={padT + plotH}
+                  stroke="#1e293b"
+                  strokeDasharray="3 3"
+                />
+                <text
+                  x={xPos}
+                  y={padT + plotH + 20}
+                  textAnchor="middle"
+                  fill="#94a3b8"
+                  fontSize="15"
+                  fontFamily="monospace"
+                >
+                  {xVal.toFixed(1)}
+                </text>
+              </g>
             );
           })}
 
           <text
             x={padL + plotW * 0.5}
-            y={height - 2}
+            y={height - 4}
             textAnchor="middle"
             fill="#cbd5e1"
-            fontSize="11"
+            fontSize="16"
             fontWeight="bold"
           >
             {xLabel}
@@ -1522,7 +1794,7 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
                 key={s.name}
                 fill="none"
                 stroke={s.color}
-                strokeWidth={2}
+                strokeWidth={2.2}
                 points={pts}
               />
             );
@@ -1539,21 +1811,21 @@ const AnalyticsPlotCard: React.FC<AnalyticsPlotCardProps> = ({
                   y2={padT + plotH}
                   stroke="#f43f5e"
                   strokeDasharray="4 2"
-                  strokeWidth={1.2}
+                  strokeWidth={1.5}
                 />
                 <circle
                   cx={scaleX(highlightPoint.x)}
                   cy={scaleY(highlightPoint.y)}
-                  r={4.5}
+                  r={5}
                   fill="#f43f5e"
                   stroke="#ffffff"
                   strokeWidth={1.5}
                 />
                 <text
-                  x={Math.min(width - 110, Math.max(padL + 6, scaleX(highlightPoint.x) + 6))}
-                  y={Math.max(padT + 14, scaleY(highlightPoint.y) - 8)}
+                  x={Math.min(width - 155, Math.max(padL + 8, scaleX(highlightPoint.x) + 8))}
+                  y={Math.max(padT + 18, scaleY(highlightPoint.y) - 10)}
                   fill="#fda4af"
-                  fontSize="10"
+                  fontSize="14"
                   fontWeight="bold"
                   fontFamily="monospace"
                 >

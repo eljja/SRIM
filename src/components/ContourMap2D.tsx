@@ -133,11 +133,11 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     const h = canvas.height;
     ctx.clearRect(0, 0, w, h);
 
-    // Compact horizontal pads so the heatmap fills the plot box edge-to-edge
-    const padL = 56;
-    const padR = 14;
-    const padT = 22;
-    const padB = 42;
+    // Compact margins sized cleanly for 1.5x font legibility
+    const padL = 78;
+    const padR = 18;
+    const padT = 28;
+    const padB = 56;
     const pw = w - padL - padR;
     const ph = h - padT - padB;
 
@@ -189,7 +189,7 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     let curD = 0;
     ctx.strokeStyle = 'rgba(148, 163, 184, 0.5)';
     ctx.setLineDash([4, 4]);
-    ctx.font = '10px Inter, sans-serif';
+    ctx.font = '14px Inter, sans-serif';
     ctx.fillStyle = '#94a3b8';
 
     for (const l of config.layers) {
@@ -200,8 +200,26 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
         ctx.moveTo(lx, padT);
         ctx.lineTo(lx, padT + ph);
         ctx.stroke();
-        ctx.fillText(l.name, lx - 20, padT - 8);
+        ctx.fillText(l.name, lx - 24, padT - 10);
       }
+    }
+
+    // X & Y Coordinate Grid Lines
+    ctx.strokeStyle = 'rgba(148, 163, 184, 0.22)';
+    ctx.lineWidth = 1;
+    for (let i = 1; i < 5; i++) {
+      const gx = padL + (pw * i) / 5;
+      ctx.beginPath();
+      ctx.moveTo(gx, padT);
+      ctx.lineTo(gx, padT + ph);
+      ctx.stroke();
+    }
+    for (let i = 1; i < 4; i++) {
+      const gy = padT + (ph * i) / 4;
+      ctx.beginPath();
+      ctx.moveTo(padL, gy);
+      ctx.lineTo(padL + pw, gy);
+      ctx.stroke();
     }
     ctx.setLineDash([]);
 
@@ -210,18 +228,20 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     ctx.lineWidth = 1.5;
     ctx.strokeRect(padL, padT, pw, ph);
 
-    // X Axis Ticks & Labels (Depth A)
+    // X Axis Ticks & Labels (Depth A) - 1.5x font size
     ctx.fillStyle = '#cbd5e1';
     ctx.textAlign = 'center';
-    ctx.font = '11px Inter, sans-serif';
+    ctx.font = '15px Inter, sans-serif';
     for (let i = 0; i <= 5; i++) {
       const dVal = (maxDepthA * i) / 5;
       const xPos = padL + (pw * i) / 5;
-      ctx.fillText(`${dVal.toFixed(0)} Å`, xPos, padT + ph + 18);
+      ctx.fillText(`${dVal.toFixed(0)} Å`, xPos, padT + ph + 22);
     }
-    ctx.fillText('Depth X (Å)', padL + pw / 2, padT + ph + 38);
+    ctx.font = 'bold 16px Inter, sans-serif';
+    ctx.fillText('Depth X (Å)', padL + pw / 2, padT + ph + 46);
 
     // Y Axis Ticks & Labels (Lateral / Radial A)
+    ctx.font = '15px Inter, sans-serif';
     ctx.textAlign = 'right';
     const minL = axisMode === 'xy' ? -maxLatA : 0;
     const maxL = maxLatA;
@@ -229,13 +249,14 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     for (let i = 0; i <= ySteps; i++) {
       const latVal = maxL - ((maxL - minL) * i) / ySteps;
       const yPos = padT + (ph * i) / ySteps;
-      ctx.fillText(`${latVal.toFixed(0)} Å`, padL - 8, yPos + 4);
+      ctx.fillText(`${latVal.toFixed(0)} Å`, padL - 8, yPos + 5);
     }
 
     ctx.save();
-    ctx.translate(20, padT + ph / 2);
+    ctx.translate(22, padT + ph / 2);
     ctx.rotate(-Math.PI / 2);
     ctx.textAlign = 'center';
+    ctx.font = 'bold 16px Inter, sans-serif';
     ctx.fillText(axisMode === 'xy' ? 'Lateral Y Axis (Å)' : 'Radial Distance R (Å)', 0, 0);
     ctx.restore();
   }, [grid, maxVal, maxDepthA, maxLatA, colormap, axisMode, showContours, config.layers, canvasWidth]);
@@ -247,10 +268,10 @@ export const ContourMap2D: React.FC<ContourMap2DProps> = ({ snapshot, config }) 
     const clientX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * canvas.width;
     const clientY = ((e.clientY - rect.top) / Math.max(1, rect.height)) * canvas.height;
 
-    const padL = 56;
-    const padR = 14;
-    const padT = 22;
-    const padB = 42;
+    const padL = 78;
+    const padR = 18;
+    const padT = 28;
+    const padB = 56;
     const pw = canvas.width - padL - padR;
     const ph = canvas.height - padT - padB;
 
